@@ -2,10 +2,11 @@
 //!
 //! Supports OpenAI or Anthropic via env vars:
 //!
-//!   OPENAI_API_KEY=sk-...  cargo run --example rig_agent
-//!   ANTHROPIC_API_KEY=sk-... cargo run --example rig_agent -- --anthropic
+//!   OPENAI_API_KEY=sk-...  cargo run --example rig_agent --features rig
+//!   ANTHROPIC_API_KEY=sk-... cargo run --example rig_agent --features rig -- --anthropic
 //!
-//! The agent can call tools (weather, calculator) and loops until done.
+//! Pass `--prebuilt` to use the `create_react_agent` convenience function
+//! instead of wiring the graph manually.
 
 use async_trait::async_trait;
 use metalcraft::*;
@@ -15,43 +16,7 @@ use rig::providers::{anthropic, openai};
 use std::sync::Arc;
 
 // ===========================================================================
-// State
-// ===========================================================================
-
-#[derive(Clone, Debug)]
-struct AgentState {
-    messages: Vec<RigMessage>,
-    tool_calls: Vec<(String, serde_json::Value, String)>, // (name, args, result)
-    final_answer: Option<String>,
-}
-
-enum Update {
-    AddToolCall {
-        name: String,
-        args: serde_json::Value,
-        result: String,
-    },
-    SetFinalAnswer(String),
-}
-
-impl Reducer for AgentState {
-    type Update = Update;
-    fn apply(&mut self, update: Update) {
-        match update {
-            Update::AddToolCall { name, args, result } => {
-                self.tool_calls.push((name, args, result.clone()));
-                self.messages
-                    .push(RigMessage::user(format!("[Tool result]: {result}")));
-            }
-            Update::SetFinalAnswer(answer) => {
-                self.final_answer = Some(answer);
-            }
-        }
-    }
-}
-
-// ===========================================================================
-// Tools
+// Tools (shared by both approaches)
 // ===========================================================================
 
 struct GetWeatherTool;
@@ -115,8 +80,40 @@ impl Tool for CalculatorTool {
 }
 
 // ===========================================================================
-// LLM Node — wraps any Rig model via the Chat trait
+// Manual approach — custom state + LlmNode (original)
 // ===========================================================================
+
+#[derive(Clone, Debug)]
+struct ManualAgentState {
+    messages: Vec<RigMessage>,
+    tool_calls: Vec<(String, serde_json::Value, String)>,
+    final_answer: Option<String>,
+}
+
+enum ManualUpdate {
+    AddToolCall {
+        name: String,
+        args: serde_json::Value,
+        result: String,
+    },
+    SetFinalAnswer(String),
+}
+
+impl Reducer for ManualAgentState {
+    type Update = ManualUpdate;
+    fn apply(&mut self, update: ManualUpdate) {
+        match update {
+            ManualUpdate::AddToolCall { name, args, result } => {
+                self.tool_calls.push((name, args, result.clone()));
+                self.messages
+                    .push(RigMessage::user(format!("[Tool result]: {result}")));
+            }
+            ManualUpdate::SetFinalAnswer(answer) => {
+                self.final_answer = Some(answer);
+            }
+        }
+    }
+}
 
 struct LlmNode<M: CompletionModel> {
     agent: rig::agent::Agent<M>,
@@ -124,8 +121,8 @@ struct LlmNode<M: CompletionModel> {
 }
 
 #[async_trait]
-impl<M: CompletionModel + 'static> Node<AgentState> for LlmNode<M> {
-    async fn run(&self, state: &AgentState) -> Result<NodeOutcome<Update>> {
+impl<M: CompletionModel + 'static> Node<ManualAgentState> for LlmNode<M> {
+    async fn run(&self, state: &ManualAgentState) -> Result<NodeOutcome<ManualUpdate>> {
         let tool_descriptions = self.registry
             .to_openai_tools()
             .iter()
@@ -174,7 +171,6 @@ impl<M: CompletionModel + 'static> Node<AgentState> for LlmNode<M> {
 
         println!("    [llm] {}", &response[..response.len().min(120)]);
 
-        // Parse tool calls
         if let Some(line) = response.lines().find(|l| l.starts_with("TOOL_CALL:")) {
             let rest = line.trim_start_matches("TOOL_CALL:").trim();
             if let Some(paren) = rest.find('(') {
@@ -188,7 +184,7 @@ impl<M: CompletionModel + 'static> Node<AgentState> for LlmNode<M> {
                 let result_str = serde_json::to_string(&result).unwrap_or_default();
                 println!("    [tool] → {result_str}");
 
-                return Ok(NodeOutcome::Update(Update::AddToolCall {
+                return Ok(NodeOutcome::Update(ManualUpdate::AddToolCall {
                     name,
                     args,
                     result: result_str,
@@ -196,11 +192,11 @@ impl<M: CompletionModel + 'static> Node<AgentState> for LlmNode<M> {
             }
         }
 
-        Ok(NodeOutcome::Update(Update::SetFinalAnswer(response)))
+        Ok(NodeOutcome::Update(ManualUpdate::SetFinalAnswer(response)))
     }
 }
 
-fn route(state: &AgentState) -> String {
+fn manual_route(state: &ManualAgentState) -> String {
     if state.final_answer.is_some() {
         END.to_string()
     } else {
@@ -208,13 +204,13 @@ fn route(state: &AgentState) -> String {
     }
 }
 
-fn build_graph<M: CompletionModel + 'static>(
+fn build_manual_graph<M: CompletionModel + 'static>(
     agent: rig::agent::Agent<M>,
     registry: Arc<ToolRegistry>,
-) -> std::result::Result<CompiledGraph<AgentState>, GraphError> {
-    Graph::<AgentState>::new()
+) -> std::result::Result<CompiledGraph<ManualAgentState>, GraphError> {
+    Graph::<ManualAgentState>::new()
         .add_node("llm", LlmNode { agent, registry })
-        .add_conditional("llm", route)
+        .add_conditional("llm", manual_route)
         .set_entry("llm")
         .compile()
 }
@@ -225,64 +221,108 @@ fn build_graph<M: CompletionModel + 'static>(
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    println!("=== metalcraft + rig agent ===\n");
-
     let args: Vec<String> = std::env::args().collect();
     let use_anthropic = args.iter().any(|a| a == "--anthropic");
+    let use_prebuilt = args.iter().any(|a| a == "--prebuilt");
 
-    let registry = Arc::new(
-        ToolRegistry::new()
-            .register(GetWeatherTool)
-            .register(CalculatorTool),
-    );
-
-    let graph = if use_anthropic {
-        println!("Provider: Anthropic\n");
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .expect("Set ANTHROPIC_API_KEY env var");
-        let client = anthropic::Client::new(&api_key)?;
-        let agent = client
-            .agent(anthropic::completion::CLAUDE_HAIKU_4_5)
-            .preamble("You are a concise assistant. Use tools when needed.")
-            .build();
-        build_graph(agent, registry.clone())?
-    } else {
-        println!("Provider: OpenAI\n");
-        let api_key =
-            std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY env var");
-        let client = openai::Client::new(&api_key)?;
-        let agent = client
-            .agent(openai::completion::GPT_4O_MINI)
-            .preamble("You are a concise assistant. Use tools when needed.")
-            .build();
-        build_graph(agent, registry.clone())?
-    };
-
-    println!("Graph:\n{}\n", graph.to_mermaid());
+    let registry = ToolRegistry::new()
+        .register(GetWeatherTool)
+        .register(CalculatorTool);
 
     let task = "What's the weather in Chicago and what is 42 * 17?";
-    println!("Task: {task}\n");
 
-    let initial = AgentState {
-        messages: vec![RigMessage::user(task)],
-        tool_calls: vec![],
-        final_answer: None,
-    };
+    if use_prebuilt {
+        // ---------------------------------------------------------------
+        // Prebuilt approach — create_react_agent
+        // ---------------------------------------------------------------
+        println!("=== metalcraft create_react_agent ===\n");
 
-    let executor = Executor::new(graph).max_steps(20);
-    let outcome = executor.run(initial, "thread-1").await?;
+        let graph = if use_anthropic {
+            println!("Provider: Anthropic\n");
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .expect("Set ANTHROPIC_API_KEY env var");
+            let client = anthropic::Client::new(&api_key)?;
+            let model = client.completion_model(anthropic::completion::CLAUDE_HAIKU_4_5);
+            create_react_agent(model, registry, "You are a concise assistant. Use tools when needed.")?
+        } else {
+            println!("Provider: OpenAI\n");
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .expect("Set OPENAI_API_KEY env var");
+            let client = openai::Client::new(&api_key)?;
+            let model = client.completion_model(openai::completion::GPT_4O_MINI);
+            create_react_agent(model, registry, "You are a concise assistant. Use tools when needed.")?
+        };
 
-    match outcome {
-        RunOutcome::Completed(state) => {
-            println!("\n=== Done ===");
-            println!("Answer: {}", state.final_answer.unwrap_or("(none)".into()));
-            println!("Tools called: {}", state.tool_calls.len());
-            for (name, args, result) in &state.tool_calls {
-                println!("  {name}({args}) → {result}");
+        println!("Graph:\n{}\n", graph.to_mermaid());
+        println!("Task: {task}\n");
+
+        let executor = Executor::new(graph).max_steps(20);
+        let outcome = executor.run(AgentState::new(task), "thread-1").await?;
+
+        match outcome {
+            RunOutcome::Completed(state) => {
+                println!("\n=== Done ===");
+                println!("Answer: {}", state.final_answer().unwrap_or("(none)"));
+                println!("Messages: {}", state.messages.len());
+            }
+            RunOutcome::Interrupted { reason, .. } => {
+                println!("\nInterrupted: {reason}");
             }
         }
-        RunOutcome::Interrupted { reason, .. } => {
-            println!("\nInterrupted: {reason}");
+    } else {
+        // ---------------------------------------------------------------
+        // Manual approach — custom state, hand-wired graph
+        // ---------------------------------------------------------------
+        println!("=== metalcraft + rig agent (manual) ===\n");
+
+        let registry = Arc::new(registry);
+
+        let graph = if use_anthropic {
+            println!("Provider: Anthropic\n");
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .expect("Set ANTHROPIC_API_KEY env var");
+            let client = anthropic::Client::new(&api_key)?;
+            let agent = client
+                .agent(anthropic::completion::CLAUDE_HAIKU_4_5)
+                .preamble("You are a concise assistant. Use tools when needed.")
+                .build();
+            build_manual_graph(agent, registry.clone())?
+        } else {
+            println!("Provider: OpenAI\n");
+            let api_key =
+                std::env::var("OPENAI_API_KEY").expect("Set OPENAI_API_KEY env var");
+            let client = openai::Client::new(&api_key)?;
+            let agent = client
+                .agent(openai::completion::GPT_4O_MINI)
+                .preamble("You are a concise assistant. Use tools when needed.")
+                .build();
+            build_manual_graph(agent, registry.clone())?
+        };
+
+        println!("Graph:\n{}\n", graph.to_mermaid());
+        println!("Task: {task}\n");
+
+        let initial = ManualAgentState {
+            messages: vec![RigMessage::user(task)],
+            tool_calls: vec![],
+            final_answer: None,
+        };
+
+        let executor = Executor::new(graph).max_steps(20);
+        let outcome = executor.run(initial, "thread-1").await?;
+
+        match outcome {
+            RunOutcome::Completed(state) => {
+                println!("\n=== Done ===");
+                println!("Answer: {}", state.final_answer.unwrap_or("(none)".into()));
+                println!("Tools called: {}", state.tool_calls.len());
+                for (name, args, result) in &state.tool_calls {
+                    println!("  {name}({args}) → {result}");
+                }
+            }
+            RunOutcome::Interrupted { reason, .. } => {
+                println!("\nInterrupted: {reason}");
+            }
         }
     }
 

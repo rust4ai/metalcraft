@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{GraphError, Result};
+use crate::executor::{Executor, RunOutcome};
 
 pub const START: &str = "__start__";
 pub const END: &str = "__end__";
@@ -204,6 +205,11 @@ pub struct CompiledGraph<S: Reducer> {
 }
 
 impl<S: Reducer> CompiledGraph<S> {
+    /// Wrap this compiled graph in an `Arc` for sharing.
+    pub fn into_arc(self) -> Arc<Self> {
+        Arc::new(self)
+    }
+
     /// Export the graph structure as a Mermaid flowchart string.
     pub fn to_mermaid(&self) -> String {
         let mut lines = vec!["flowchart TD".to_string()];
@@ -226,5 +232,69 @@ impl<S: Reducer> CompiledGraph<S> {
         }
 
         lines.join("\n")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SubgraphNode — run a compiled graph as a node inside another graph
+// ---------------------------------------------------------------------------
+
+/// A node that runs an inner [`CompiledGraph`] as a subgraph.
+///
+/// `extract` maps outer state → inner state, the inner graph runs to completion
+/// (or interruption), and `merge` maps the final inner state back to an outer
+/// state update.
+///
+/// The inner graph runs ephemerally (no shared checkpointing). If the inner
+/// graph interrupts, the outer graph also interrupts after merging the partial
+/// inner state.
+pub struct SubgraphNode<SOuter: Reducer, SInner: Reducer> {
+    graph: Arc<CompiledGraph<SInner>>,
+    extract: Arc<dyn Fn(&SOuter) -> SInner + Send + Sync>,
+    merge: Arc<dyn Fn(SInner) -> SOuter::Update + Send + Sync>,
+    max_steps: usize,
+}
+
+impl<SOuter: Reducer, SInner: Reducer> SubgraphNode<SOuter, SInner> {
+    pub fn new(
+        graph: Arc<CompiledGraph<SInner>>,
+        extract: impl Fn(&SOuter) -> SInner + Send + Sync + 'static,
+        merge: impl Fn(SInner) -> SOuter::Update + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            graph,
+            extract: Arc::new(extract),
+            merge: Arc::new(merge),
+            max_steps: 100,
+        }
+    }
+
+    pub fn max_steps(mut self, n: usize) -> Self {
+        self.max_steps = n;
+        self
+    }
+}
+
+#[async_trait]
+impl<SOuter: Reducer, SInner: Reducer> Node<SOuter> for SubgraphNode<SOuter, SInner> {
+    async fn run(&self, state: &SOuter) -> Result<NodeOutcome<SOuter::Update>> {
+        let inner_state = (self.extract)(state);
+        let executor = Executor::new_from_arc(self.graph.clone()).max_steps(self.max_steps);
+
+        match executor.run(inner_state, "__subgraph__").await? {
+            RunOutcome::Completed(final_inner) => {
+                Ok(NodeOutcome::Update((self.merge)(final_inner)))
+            }
+            RunOutcome::Interrupted {
+                state: partial_inner,
+                reason,
+                ..
+            } => {
+                Ok(NodeOutcome::interrupt_with(
+                    (self.merge)(partial_inner),
+                    reason,
+                ))
+            }
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "metalcraft"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A LangGraph-style stateful graph orchestrator for AI agents in Rust"
 license = "MIT"
@@ -36,6 +36,10 @@ path = "examples/agent_loop.rs"
 [[example]]
 name = "human_in_the_loop"
 path = "examples/human_in_the_loop.rs"
+
+[[example]]
+name = "subgraph"
+path = "examples/subgraph.rs"
 
 [[example]]
 name = "rig_agent"

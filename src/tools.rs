@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{GraphError, Result};
+use crate::graph::{Node, NodeOutcome, Reducer};
 
 // ---------------------------------------------------------------------------
 // Tool trait — define tools as typed Rust structs
@@ -93,5 +94,79 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ToolCallState — state trait for automatic tool execution
+// ---------------------------------------------------------------------------
+
+/// A pending tool call extracted from LLM output.
+#[derive(Debug, Clone)]
+pub struct PendingToolCall {
+    pub id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
+/// The result of executing a single tool call.
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub id: String,
+    pub name: String,
+    pub result: std::result::Result<serde_json::Value, String>,
+}
+
+/// States that carry pending tool calls and can accept tool results.
+///
+/// Implement this trait on your state to use [`ToolNode`] for automatic
+/// tool execution.
+pub trait ToolCallState: Reducer {
+    /// Return the list of pending tool calls that need to be executed.
+    fn pending_tool_calls(&self) -> Vec<PendingToolCall>;
+
+    /// Produce a state update that records the given tool results.
+    fn tool_results_update(results: Vec<ToolResult>) -> Self::Update;
+}
+
+// ---------------------------------------------------------------------------
+// ToolNode — executes pending tool calls from state via the registry
+// ---------------------------------------------------------------------------
+
+/// A graph node that reads pending tool calls from state, executes them
+/// via a [`ToolRegistry`], and returns the results as a state update.
+pub struct ToolNode {
+    registry: Arc<ToolRegistry>,
+}
+
+impl ToolNode {
+    pub fn new(registry: Arc<ToolRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl<S: ToolCallState> Node<S> for ToolNode {
+    async fn run(&self, state: &S) -> Result<NodeOutcome<S::Update>> {
+        let pending = state.pending_tool_calls();
+        let mut results = Vec::with_capacity(pending.len());
+
+        for call in pending {
+            let result = match self.registry.call(&call.name, call.args.clone()).await {
+                Ok(value) => ToolResult {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    result: Ok(value),
+                },
+                Err(e) => ToolResult {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    result: Err(e.to_string()),
+                },
+            };
+            results.push(result);
+        }
+
+        Ok(NodeOutcome::Update(S::tool_results_update(results)))
     }
 }

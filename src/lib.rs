@@ -13,11 +13,19 @@ mod checkpoint;
 mod error;
 pub mod tools;
 
+#[cfg(feature = "rig")]
+pub mod prebuilt;
+
 pub use error::{GraphError, Result};
-pub use graph::{Graph, CompiledGraph, Edge, Node, NodeOutcome, Reducer, START, END};
+pub use graph::{Graph, CompiledGraph, Edge, Node, NodeOutcome, Reducer, SubgraphNode, START, END};
 pub use executor::{Executor, StepEvent, RunOutcome};
 pub use checkpoint::{Checkpointer, MemoryCheckpointer};
-pub use tools::{Tool, ToolRegistry};
+pub use tools::{Tool, ToolRegistry, PendingToolCall, ToolResult, ToolCallState, ToolNode};
+
+#[cfg(feature = "rig")]
+pub use prebuilt::{
+    AgentMessage, AgentState, AgentUpdate, ReactAgentNode, create_react_agent,
+};
 
 /// Re-export Rig when the `rig` feature is enabled.
 #[cfg(feature = "rig")]

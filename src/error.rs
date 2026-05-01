@@ -22,6 +22,9 @@ pub enum GraphError {
 
     #[error("graph interrupted at '{node}': {reason}")]
     Interrupted { node: String, reason: String },
+
+    #[error("tool call failed for '{tool}': {message}")]
+    ToolCallFailed { tool: String, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, GraphError>;
