@@ -1,0 +1,50 @@
+[package]
+name = "metalcraft"
+version = "0.1.0"
+edition = "2021"
+description = "A LangGraph-style stateful graph orchestrator for AI agents in Rust"
+license = "MIT"
+repository = "https://github.com/rust4ai/metalcraft"
+homepage = "https://github.com/rust4ai/metalcraft"
+readme = "README.md"
+keywords = ["ai", "agents", "graph", "orchestrator", "llm"]
+categories = ["asynchronous", "data-structures"]
+
+[dependencies]
+tokio        = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-trait  = "0.1"
+futures      = "0.3"
+thiserror    = "2"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+tracing      = "0.1"
+rig           = { version = "0.36", optional = true }
+
+[features]
+default = []
+rig = ["dep:rig"]
+
+[dev-dependencies]
+spice-framework = "0.1"
+rig              = "0.36"
+
+[[example]]
+name = "agent_loop"
+path = "examples/agent_loop.rs"
+
+[[example]]
+name = "human_in_the_loop"
+path = "examples/human_in_the_loop.rs"
+
+[[example]]
+name = "rig_agent"
+path = "examples/rig_agent.rs"
+
+[[example]]
+name = "spice_test"
+path = "examples/spice_test.rs"
+
+[[example]]
+name = "spice_llm_test"
+path = "examples/spice_llm_test.rs"
