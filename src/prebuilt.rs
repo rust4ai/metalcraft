@@ -7,7 +7,7 @@
 //! [`ToolRegistry`].
 
 use async_trait::async_trait;
-use rig::completion::{Chat, CompletionModel, Message as RigMessage};
+use rig::completion::{AssistantContent, CompletionModel, Message as RigMessage, ToolDefinition};
 use std::sync::Arc;
 
 use crate::error::{GraphError, Result};
@@ -59,11 +59,13 @@ pub enum AgentMessage {
     Assistant(String),
     ToolCall {
         id: String,
+        call_id: Option<String>,
         name: String,
         args: serde_json::Value,
     },
     ToolResult {
         id: String,
+        call_id: Option<String>,
         name: String,
         result: String,
     },
@@ -124,7 +126,7 @@ impl AgentState {
                         });
                     }
                 }
-                AgentMessage::ToolCall { id, name, args } => {
+                AgentMessage::ToolCall { id, name, args, .. } => {
                     // If we had tool results from a previous batch, flush that turn
                     if !current_tool_results.is_empty() {
                         turns.push(AgentTurn {
@@ -140,7 +142,7 @@ impl AgentState {
                         args: args.clone(),
                     });
                 }
-                AgentMessage::ToolResult { id, name, result } => {
+                AgentMessage::ToolResult { id, name, result, .. } => {
                     current_tool_results.push(AgentToolResult {
                         id: id.clone(),
                         name: name.clone(),
@@ -227,6 +229,7 @@ impl Reducer for AgentState {
                 for call in &calls {
                     self.messages.push(AgentMessage::ToolCall {
                         id: call.id.clone(),
+                        call_id: call.call_id.clone(),
                         name: call.name.clone(),
                         args: call.args.clone(),
                     });
@@ -247,6 +250,7 @@ impl Reducer for AgentState {
                     };
                     self.messages.push(AgentMessage::ToolResult {
                         id: r.id.clone(),
+                        call_id: r.call_id.clone(),
                         name: r.name.clone(),
                         result: result_text,
                     });
@@ -268,85 +272,91 @@ impl ToolCallState for AgentState {
 }
 
 // ---------------------------------------------------------------------------
-// ReactAgentNode — LLM node that parses tool calls
+// ReactAgentNode — LLM node using native tool calling
 // ---------------------------------------------------------------------------
 
-/// A graph node that calls a Rig [`CompletionModel`] and parses tool-call
-/// directives from its response.
+/// A graph node that calls a Rig [`CompletionModel`] with native tool
+/// definitions and parses structured tool calls from the response.
 ///
 /// Produces [`AgentUpdate::ToolCalls`] when the LLM wants to use tools,
 /// or [`AgentUpdate::FinalAnswer`] when it has a direct answer.
 pub struct ReactAgentNode<M: CompletionModel> {
-    agent: rig::agent::Agent<M>,
+    model: M,
+    system_prompt: String,
     registry: Arc<ToolRegistry>,
 }
 
 impl<M: CompletionModel> ReactAgentNode<M> {
-    pub fn new(agent: rig::agent::Agent<M>, registry: Arc<ToolRegistry>) -> Self {
-        Self { agent, registry }
+    pub fn new(model: M, system_prompt: String, registry: Arc<ToolRegistry>) -> Self {
+        Self {
+            model,
+            system_prompt,
+            registry,
+        }
     }
 }
 
 #[async_trait]
 impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
     async fn run(&self, state: &AgentState) -> Result<NodeOutcome<AgentUpdate>> {
-        let tool_descriptions = self
+        // Convert our ToolRegistry into rig ToolDefinitions
+        let tool_defs: Vec<ToolDefinition> = self
             .registry
             .to_openai_tools()
             .iter()
-            .map(|t| {
-                let name = &t["function"]["name"];
-                let desc = &t["function"]["description"];
-                let params = &t["function"]["parameters"]["properties"];
-                format!("- {name}: {desc}\n  Parameters: {params}")
+            .map(|t| ToolDefinition {
+                name: t["function"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                description: t["function"]["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                parameters: t["function"]["parameters"].clone(),
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect();
 
-        let tool_instructions = format!(
-            "You have these tools. To use one, respond EXACTLY with \
-             `TOOL_CALL: tool_name({{\"param_name\": \"value\"}})` on its own line.\n\
-             Use the EXACT parameter names shown below. \
-             When done, respond normally with no TOOL_CALL.\n\nTools:\n{tool_descriptions}"
-        );
-
-        // Build full conversation history for the LLM
-        let (prompt, history) = self.build_conversation(state, &tool_instructions);
+        // Build conversation history
+        let (prompt, history) = self.build_conversation(state);
 
         let response = self
-            .agent
-            .chat(&prompt, history)
+            .model
+            .completion_request(prompt)
+            .preamble(self.system_prompt.clone())
+            .messages(history)
+            .tools(tool_defs)
+            .send()
             .await
             .map_err(|e| GraphError::Node {
                 node: "agent".into(),
                 message: e.to_string(),
             })?;
 
-        // Parse tool calls from the response
+        // Parse response: extract tool calls and text from AssistantContent
         let mut tool_calls = Vec::new();
-        let mut call_counter = 0u32;
+        let mut text_parts = Vec::new();
 
-        for line in response.lines() {
-            if line.starts_with("TOOL_CALL:") {
-                let rest = line.trim_start_matches("TOOL_CALL:").trim();
-                if let Some(paren) = rest.find('(') {
-                    let name = rest[..paren].trim().to_string();
-                    let args_str = rest[paren..].trim_start_matches('(').trim_end_matches(')');
-                    let args: serde_json::Value =
-                        serde_json::from_str(args_str).unwrap_or(serde_json::json!({}));
-
+        for content in response.choice {
+            match content {
+                AssistantContent::ToolCall(tc) => {
                     tool_calls.push(PendingToolCall {
-                        id: format!("call_{call_counter}"),
-                        name,
-                        args,
+                        id: tc.id.clone(),
+                        call_id: tc.call_id.clone(),
+                        name: tc.function.name.clone(),
+                        args: tc.function.arguments.clone(),
                     });
-                    call_counter += 1;
                 }
+                AssistantContent::Text(t) => {
+                    text_parts.push(t.text);
+                }
+                _ => {} // Reasoning, Image — ignore
             }
         }
 
         if tool_calls.is_empty() {
-            Ok(NodeOutcome::Update(AgentUpdate::FinalAnswer(response)))
+            let final_text = text_parts.join("\n");
+            Ok(NodeOutcome::Update(AgentUpdate::FinalAnswer(final_text)))
         } else {
             Ok(NodeOutcome::Update(AgentUpdate::ToolCalls(tool_calls)))
         }
@@ -354,21 +364,14 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
 }
 
 impl<M: CompletionModel> ReactAgentNode<M> {
-    /// Build the full conversation for the LLM from agent state.
+    /// Build the conversation history from agent state.
     ///
-    /// Returns (current_prompt, chat_history) where history contains
-    /// the tool instructions and all prior messages.
-    fn build_conversation(
-        &self,
-        state: &AgentState,
-        tool_instructions: &str,
-    ) -> (String, Vec<RigMessage>) {
-        let mut history = vec![RigMessage::system(tool_instructions)];
+    /// Returns (prompt_message, chat_history).
+    fn build_conversation(&self, state: &AgentState) -> (RigMessage, Vec<RigMessage>) {
+        let mut history: Vec<RigMessage> = Vec::new();
 
-        // Convert all messages except the last into chat history.
-        // The last message becomes the prompt.
         if state.messages.is_empty() {
-            return (String::new(), history);
+            return (RigMessage::user(""), history);
         }
 
         let (earlier, last) = state.messages.split_at(state.messages.len() - 1);
@@ -381,33 +384,54 @@ impl<M: CompletionModel> ReactAgentNode<M> {
                 AgentMessage::Assistant(text) => {
                     history.push(RigMessage::assistant(text));
                 }
-                AgentMessage::ToolCall { name, args, .. } => {
-                    let args_str = serde_json::to_string(args).unwrap_or_default();
-                    history.push(RigMessage::assistant(format!(
-                        "TOOL_CALL: {name}({args_str})"
-                    )));
+                AgentMessage::ToolCall {
+                    id, call_id, name, args,
+                } => {
+                    let mut tc = rig::completion::message::ToolCall::new(
+                        id.clone(),
+                        rig::completion::message::ToolFunction {
+                            name: name.clone(),
+                            arguments: args.clone(),
+                        },
+                    );
+                    if let Some(cid) = call_id {
+                        tc = tc.with_call_id(cid.clone());
+                    }
+                    history.push(RigMessage::from(tc));
                 }
-                AgentMessage::ToolResult { name, result, .. } => {
-                    history.push(RigMessage::user(format!(
-                        "[Tool result for '{name}']: {result}"
-                    )));
+                AgentMessage::ToolResult {
+                    id, call_id, result, ..
+                } => {
+                    let cid = call_id.clone().or_else(|| Some(id.clone()));
+                    history.push(RigMessage::tool_result_with_call_id(id, cid, result));
                 }
             }
         }
 
         // The last message becomes the prompt
         let prompt = match &last[0] {
-            AgentMessage::User(text) => text.clone(),
-            AgentMessage::Assistant(text) => text.clone(),
-            AgentMessage::ToolResult { name, result, .. } => {
-                format!(
-                    "[Tool result for '{name}']: {result}\n\n\
-                     Provide your final answer or call another tool."
-                )
+            AgentMessage::User(text) => RigMessage::user(text),
+            AgentMessage::Assistant(text) => RigMessage::user(text),
+            AgentMessage::ToolResult {
+                id, call_id, result, ..
+            } => {
+                let cid = call_id.clone().or_else(|| Some(id.clone()));
+                RigMessage::tool_result_with_call_id(id, cid, result)
             }
-            AgentMessage::ToolCall { name, args, .. } => {
-                let args_str = serde_json::to_string(args).unwrap_or_default();
-                format!("TOOL_CALL: {name}({args_str})")
+            AgentMessage::ToolCall {
+                id, call_id, name, args,
+            } => {
+                let mut tc = rig::completion::message::ToolCall::new(
+                    id.clone(),
+                    rig::completion::message::ToolFunction {
+                        name: name.clone(),
+                        arguments: args.clone(),
+                    },
+                );
+                if let Some(cid) = call_id {
+                    tc = tc.with_call_id(cid.clone());
+                }
+                RigMessage::from(tc)
             }
         };
 
@@ -458,22 +482,6 @@ pub fn create_react_agent<M: CompletionModel + 'static>(
 ///
 /// The hook runs before each tool execution and can approve or deny calls.
 /// See [`BeforeToolCallHook`] for details.
-///
-/// ```ignore
-/// use metalcraft::{create_react_agent_with_hooks, BeforeToolCallAction};
-/// use std::sync::Arc;
-///
-/// let hook = Arc::new(|name: &str, args: &serde_json::Value| {
-///     if name == "bash" {
-///         // prompt user...
-///         BeforeToolCallAction::Proceed
-///     } else {
-///         BeforeToolCallAction::Proceed
-///     }
-/// });
-///
-/// let graph = create_react_agent_with_hooks(model, tools, "prompt", Some(hook))?;
-/// ```
 pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
     model: M,
     tools: ToolRegistry,
@@ -482,11 +490,7 @@ pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
 ) -> Result<CompiledGraph<AgentState>> {
     let registry = Arc::new(tools);
 
-    let agent = rig::agent::AgentBuilder::new(model)
-        .preamble(&system_prompt.into())
-        .build();
-
-    let agent_node = ReactAgentNode::new(agent, registry.clone());
+    let agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone());
     let mut tool_node = ToolNode::new(registry);
     if let Some(hook) = before_tool_call {
         tool_node = tool_node.with_before_hook(hook);

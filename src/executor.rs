@@ -50,10 +50,23 @@ enum StepResult {
 // Executor — runs a compiled graph to completion
 // ---------------------------------------------------------------------------
 
+/// Action returned by a step guard callback.
+pub enum GuardAction {
+    /// Continue execution normally.
+    Continue,
+    /// Stop execution with an interrupt reason.
+    Stop(String),
+}
+
+/// A callback invoked after each step. Receives the current state, the node
+/// that just ran, and the next node. Can halt execution early.
+pub type StepGuard<S> = Arc<dyn Fn(&S, &StepEvent) -> GuardAction + Send + Sync>;
+
 pub struct Executor<S: Reducer> {
     graph: Arc<CompiledGraph<S>>,
     checkpointer: Option<Arc<dyn Checkpointer<S>>>,
     max_steps: usize,
+    step_guard: Option<StepGuard<S>>,
 }
 
 impl<S: Reducer> Executor<S> {
@@ -62,6 +75,7 @@ impl<S: Reducer> Executor<S> {
             graph: Arc::new(graph),
             checkpointer: None,
             max_steps: 100,
+            step_guard: None,
         }
     }
 
@@ -72,6 +86,7 @@ impl<S: Reducer> Executor<S> {
             graph,
             checkpointer: None,
             max_steps: 100,
+            step_guard: None,
         }
     }
 
@@ -87,6 +102,16 @@ impl<S: Reducer> Executor<S> {
         self
     }
 
+    /// Set a guard that runs after each step.
+    ///
+    /// The guard receives the current state and step event, and can
+    /// halt execution by returning [`GuardAction::Stop`]. Useful for
+    /// loop detection, error-spiral protection, or custom policies.
+    pub fn with_step_guard(mut self, guard: StepGuard<S>) -> Self {
+        self.step_guard = Some(guard);
+        self
+    }
+
     /// Run the graph to completion (or interruption).
     pub async fn run(&self, mut state: S, thread_id: &str) -> Result<RunOutcome<S>> {
         let mut current = self.graph.entry.clone();
@@ -98,6 +123,24 @@ impl<S: Reducer> Executor<S> {
 
             match self.execute_step(&mut state, &current, step).await? {
                 StepResult::Continue(next) => {
+                    // Run step guard
+                    if let Some(guard) = &self.step_guard {
+                        let event = StepEvent {
+                            node: current.clone(),
+                            next: next.clone(),
+                        };
+                        if let GuardAction::Stop(reason) = guard(&state, &event) {
+                            if let Some(cp) = &self.checkpointer {
+                                cp.save(thread_id, &state, &next).await?;
+                            }
+                            return Ok(RunOutcome::Interrupted {
+                                state,
+                                reason,
+                                resume_from: next,
+                            });
+                        }
+                    }
+
                     if let Some(cp) = &self.checkpointer {
                         cp.save(thread_id, &state, &next).await?;
                     }
@@ -107,7 +150,6 @@ impl<S: Reducer> Executor<S> {
                     reason,
                     resume_from,
                 } => {
-                    // Save checkpoint so we can resume later
                     if let Some(cp) = &self.checkpointer {
                         cp.save(thread_id, &state, &resume_from).await?;
                     }
@@ -155,6 +197,20 @@ impl<S: Reducer> Executor<S> {
 
             match self.execute_step(&mut state, &current, step).await? {
                 StepResult::Continue(next) => {
+                    if let Some(guard) = &self.step_guard {
+                        let event = StepEvent {
+                            node: current.clone(),
+                            next: next.clone(),
+                        };
+                        if let GuardAction::Stop(reason) = guard(&state, &event) {
+                            cp.save(thread_id, &state, &next).await?;
+                            return Ok(RunOutcome::Interrupted {
+                                state,
+                                reason,
+                                resume_from: next,
+                            });
+                        }
+                    }
                     cp.save(thread_id, &state, &next).await?;
                     current = next;
                 }

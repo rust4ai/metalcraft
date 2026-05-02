@@ -13,6 +13,9 @@ Build complex, stateful agentic workflows with typed state, cyclic graphs, human
 - **Checkpointing** — Pluggable persistence via the `Checkpointer` trait. Ships with `MemoryCheckpointer`.
 - **Async streaming** — Stream step-by-step execution events in real time.
 - **Tool registry** — Define tools once, export to Anthropic or OpenAI format.
+- **Before-tool hooks** — Approve, deny, or log tool calls before execution via `BeforeToolCallHook`.
+- **Step guards** — Executor-level callbacks to detect loops, error spirals, or enforce custom policies.
+- **Native tool calling** — Rig integration uses structured `ToolDefinition` and `AssistantContent::ToolCall`, not string parsing.
 - **LLM integration** — Optional [Rig](https://docs.rig.rs) support for provider-agnostic model access.
 - **Visualization** — Export any graph as a Mermaid flowchart.
 
@@ -22,7 +25,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-metalcraft = "0.1"
+metalcraft = "0.3"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
@@ -213,7 +216,7 @@ impl Tool for WeatherTool {
             "required": ["city"]
         })
     }
-    async fn call(&self, args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    async fn call(&self, args: serde_json::Value) -> metalcraft::Result<serde_json::Value> {
         let city = args["city"].as_str().unwrap_or("unknown");
         Ok(serde_json::json!({ "temp": "72°F", "city": city }))
     }
@@ -225,13 +228,67 @@ let openai_tools = registry.to_openai_tools();
 let result = registry.call("get_weather", serde_json::json!({"city": "NYC"})).await?;
 ```
 
+## Step Guards
+
+Detect runaway agents at the executor level. Guards run after each step and can halt execution:
+
+```rust
+use metalcraft::*;
+use std::sync::{Arc, Mutex};
+
+let error_count = Arc::new(Mutex::new(0u32));
+let ec = error_count.clone();
+
+let guard: StepGuard<MyState> = Arc::new(move |state: &MyState, event: &StepEvent| {
+    // Stop after 3 consecutive errors
+    let mut count = ec.lock().unwrap();
+    if event.node == "tool" && state.has_error() {
+        *count += 1;
+    } else {
+        *count = 0;
+    }
+    if *count >= 3 {
+        GuardAction::Stop("Too many consecutive errors".into())
+    } else {
+        GuardAction::Continue
+    }
+});
+
+let executor = Executor::new(graph)
+    .with_step_guard(guard)
+    .max_steps(50);
+```
+
+Guards return `RunOutcome::Interrupted`, so execution is resumable. See [`examples/step_guard.rs`](examples/step_guard.rs) for a full example with loop detection.
+
+## Before-Tool Hooks
+
+Approve or deny tool calls before execution:
+
+```rust
+use metalcraft::*;
+use std::sync::Arc;
+
+let hook: BeforeToolCallHook = Arc::new(|name: &str, args: &serde_json::Value| {
+    if name == "delete_file" {
+        BeforeToolCallAction::Deny("File deletion not allowed".into())
+    } else {
+        BeforeToolCallAction::Proceed
+    }
+});
+
+let tool_node = ToolNode::new(Arc::new(registry)).with_before_hook(hook);
+```
+
+Denied calls produce an error result the LLM can see and react to.
+
 ## LLM Integration (Rig)
 
 Enable the `rig` feature for provider-agnostic LLM access:
 
 ```toml
 [dependencies]
-metalcraft = { version = "0.1", features = ["rig"] }
+metalcraft = { version = "0.3", features = ["rig"] }
 ```
 
 See [`examples/rig_agent.rs`](examples/rig_agent.rs) for a full LLM-powered agent with tool calling.
@@ -244,6 +301,7 @@ See [`examples/rig_agent.rs`](examples/rig_agent.rs) for a full LLM-powered agen
 | [`human_in_the_loop`](examples/human_in_the_loop.rs) | Draft, review with interrupt, resume with approval |
 | [`rig_agent`](examples/rig_agent.rs) | LLM-powered agent using Rig (OpenAI/Anthropic) |
 | [`spice_test`](examples/spice_test.rs) | Behavioral testing with Spice framework |
+| [`step_guard`](examples/step_guard.rs) | Loop detection and error-spiral protection |
 | [`spice_llm_test`](examples/spice_llm_test.rs) | LLM agent + Spice declarative tests |
 
 Run an example:
@@ -255,27 +313,32 @@ cargo run --example agent_loop
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   Executor                       │
-│  run() / resume() / stream()                     │
-│                                                  │
-│  ┌───────────────────────────────────────────┐   │
-│  │            CompiledGraph                   │   │
-│  │                                            │   │
-│  │  ┌──────┐    ┌──────┐    ┌──────┐         │   │
-│  │  │ Node │───→│ Node │───→│ Node │──→ END  │   │
-│  │  └──────┘    └──────┘    └──────┘         │   │
-│  │       ↑          │                         │   │
-│  │       └──────────┘  (cycle)                │   │
-│  │                                            │   │
-│  │  Edges: Static | Conditional | Parallel    │   │
-│  └───────────────────────────────────────────┘   │
-│                                                  │
-│  ┌──────────────┐    ┌───────────────────┐       │
-│  │ Checkpointer │    │   ToolRegistry    │       │
-│  │ save / load  │    │ call / export     │       │
-│  └──────────────┘    └───────────────────┘       │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│                   Executor                        │
+│  run() / resume() / stream()                      │
+│                                                   │
+│  ┌────────────────────────────────────────────┐   │
+│  │            CompiledGraph                    │   │
+│  │                                             │   │
+│  │  ┌──────┐    ┌──────┐    ┌──────┐          │   │
+│  │  │ Node │───→│ Node │───→│ Node │──→ END   │   │
+│  │  └──────┘    └──────┘    └──────┘          │   │
+│  │       ↑          │                          │   │
+│  │       └──────────┘  (cycle)                 │   │
+│  │                                             │   │
+│  │  Edges: Static | Conditional | Parallel     │   │
+│  └────────────────────────────────────────────┘   │
+│                                                   │
+│  ┌──────────────┐  ┌───────────────┐              │
+│  │ Checkpointer │  │ ToolRegistry  │              │
+│  │ save / load  │  │ call / export │              │
+│  └──────────────┘  └───────────────┘              │
+│                                                   │
+│  ┌──────────────┐  ┌─────────────────────┐        │
+│  │  StepGuard   │  │ BeforeToolCallHook  │        │
+│  │ loop/error   │  │  approve / deny     │        │
+│  └──────────────┘  └─────────────────────┘        │
+└──────────────────────────────────────────────────┘
 
 State: Reducer trait + typed Update enum
 ```

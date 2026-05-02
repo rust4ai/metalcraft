@@ -105,6 +105,10 @@ impl Default for ToolRegistry {
 #[derive(Debug, Clone)]
 pub struct PendingToolCall {
     pub id: String,
+    /// Secondary ID used by some providers (e.g. OpenAI's `call_id`) to link
+    /// tool results back to tool calls. When present, tool results should
+    /// reference this ID.
+    pub call_id: Option<String>,
     pub name: String,
     pub args: serde_json::Value,
 }
@@ -113,6 +117,7 @@ pub struct PendingToolCall {
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub id: String,
+    pub call_id: Option<String>,
     pub name: String,
     pub result: std::result::Result<serde_json::Value, String>,
 }
@@ -194,6 +199,7 @@ impl<S: ToolCallState> Node<S> for ToolNode {
                     BeforeToolCallAction::Deny(reason) => {
                         results.push(ToolResult {
                             id: call.id.clone(),
+                            call_id: call.call_id.clone(),
                             name: call.name.clone(),
                             result: Err(reason),
                         });
@@ -205,11 +211,13 @@ impl<S: ToolCallState> Node<S> for ToolNode {
             let result = match self.registry.call(&call.name, call.args.clone()).await {
                 Ok(value) => ToolResult {
                     id: call.id.clone(),
+                    call_id: call.call_id.clone(),
                     name: call.name.clone(),
                     result: Ok(value),
                 },
                 Err(e) => ToolResult {
                     id: call.id.clone(),
+                    call_id: call.call_id.clone(),
                     name: call.name.clone(),
                     result: Err(e.to_string()),
                 },

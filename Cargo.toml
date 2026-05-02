@@ -1,6 +1,6 @@
 [package]
 name = "metalcraft"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "A LangGraph-style stateful graph orchestrator for AI agents in Rust"
 license = "MIT"
@@ -52,3 +52,7 @@ path = "examples/spice_test.rs"
 [[example]]
 name = "spice_llm_test"
 path = "examples/spice_llm_test.rs"
+
+[[example]]
+name = "step_guard"
+path = "examples/step_guard.rs"

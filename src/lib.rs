@@ -18,7 +18,7 @@ pub mod prebuilt;
 
 pub use error::{GraphError, Result};
 pub use graph::{Graph, CompiledGraph, Edge, Node, NodeOutcome, Reducer, SubgraphNode, START, END};
-pub use executor::{Executor, StepEvent, RunOutcome};
+pub use executor::{Executor, GuardAction, StepEvent, StepGuard, RunOutcome};
 pub use checkpoint::{Checkpointer, MemoryCheckpointer};
 pub use tools::{
     Tool, ToolRegistry, PendingToolCall, ToolResult, ToolCallState, ToolNode,
