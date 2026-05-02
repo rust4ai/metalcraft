@@ -17,6 +17,38 @@ use crate::tools::{
 };
 
 // ---------------------------------------------------------------------------
+// AgentTurn — structured turn data extracted from message history
+// ---------------------------------------------------------------------------
+
+/// A tool call within an agent turn.
+#[derive(Debug, Clone)]
+pub struct AgentToolCall {
+    pub id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
+/// A tool result within an agent turn.
+#[derive(Debug, Clone)]
+pub struct AgentToolResult {
+    pub id: String,
+    pub name: String,
+    pub result: String,
+}
+
+/// A single turn in the agent's execution, extracted from the message history.
+///
+/// Each turn represents one LLM response cycle: the agent either calls tools
+/// (with subsequent results) or produces a final text answer.
+#[derive(Debug, Clone)]
+pub struct AgentTurn {
+    pub index: usize,
+    pub tool_calls: Vec<AgentToolCall>,
+    pub tool_results: Vec<AgentToolResult>,
+    pub assistant_text: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // AgentMessage — typed conversation history
 // ---------------------------------------------------------------------------
 
@@ -68,6 +100,96 @@ impl AgentState {
         self.pending_tool_calls.clear();
         self.is_done = false;
         self
+    }
+
+    /// Extract structured turn data from the message history.
+    ///
+    /// Each turn corresponds to one LLM response: either a set of tool calls
+    /// (followed by their results) or a final assistant text.
+    pub fn turns(&self) -> Vec<AgentTurn> {
+        let mut turns = Vec::new();
+        let mut current_tool_calls: Vec<AgentToolCall> = Vec::new();
+        let mut current_tool_results: Vec<AgentToolResult> = Vec::new();
+
+        for msg in &self.messages {
+            match msg {
+                AgentMessage::User(_) => {
+                    // Flush any pending turn
+                    if !current_tool_calls.is_empty() {
+                        turns.push(AgentTurn {
+                            index: turns.len(),
+                            tool_calls: std::mem::take(&mut current_tool_calls),
+                            tool_results: std::mem::take(&mut current_tool_results),
+                            assistant_text: None,
+                        });
+                    }
+                }
+                AgentMessage::ToolCall { id, name, args } => {
+                    // If we had tool results from a previous batch, flush that turn
+                    if !current_tool_results.is_empty() {
+                        turns.push(AgentTurn {
+                            index: turns.len(),
+                            tool_calls: std::mem::take(&mut current_tool_calls),
+                            tool_results: std::mem::take(&mut current_tool_results),
+                            assistant_text: None,
+                        });
+                    }
+                    current_tool_calls.push(AgentToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args: args.clone(),
+                    });
+                }
+                AgentMessage::ToolResult { id, name, result } => {
+                    current_tool_results.push(AgentToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        result: result.clone(),
+                    });
+                }
+                AgentMessage::Assistant(text) => {
+                    // Flush any pending tool turn first
+                    if !current_tool_calls.is_empty() {
+                        turns.push(AgentTurn {
+                            index: turns.len(),
+                            tool_calls: std::mem::take(&mut current_tool_calls),
+                            tool_results: std::mem::take(&mut current_tool_results),
+                            assistant_text: None,
+                        });
+                    }
+                    // The assistant text is its own turn
+                    turns.push(AgentTurn {
+                        index: turns.len(),
+                        tool_calls: vec![],
+                        tool_results: vec![],
+                        assistant_text: Some(text.clone()),
+                    });
+                }
+            }
+        }
+
+        // Flush any remaining
+        if !current_tool_calls.is_empty() {
+            turns.push(AgentTurn {
+                index: turns.len(),
+                tool_calls: current_tool_calls,
+                tool_results: current_tool_results,
+                assistant_text: None,
+            });
+        }
+
+        turns
+    }
+
+    /// Get all tool names called across the entire conversation.
+    pub fn tools_called(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::ToolCall { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Get the final assistant response, if the agent is done.
