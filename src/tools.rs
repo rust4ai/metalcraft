@@ -130,18 +130,53 @@ pub trait ToolCallState: Reducer {
 }
 
 // ---------------------------------------------------------------------------
+// BeforeToolCall hook
+// ---------------------------------------------------------------------------
+
+/// Result of a `before_tool_call` hook.
+pub enum BeforeToolCallAction {
+    /// Proceed with executing the tool.
+    Proceed,
+    /// Skip this tool call and return an error message instead.
+    Deny(String),
+}
+
+/// A hook called before each tool execution.
+///
+/// Receives the tool name and arguments. Can approve or deny execution.
+/// Useful for human-in-the-loop approval, logging, or policy enforcement.
+pub type BeforeToolCallHook =
+    Arc<dyn Fn(&str, &serde_json::Value) -> BeforeToolCallAction + Send + Sync>;
+
+// ---------------------------------------------------------------------------
 // ToolNode — executes pending tool calls from state via the registry
 // ---------------------------------------------------------------------------
 
 /// A graph node that reads pending tool calls from state, executes them
 /// via a [`ToolRegistry`], and returns the results as a state update.
+///
+/// Supports an optional `before_tool_call` hook for approval/policy checks.
 pub struct ToolNode {
     registry: Arc<ToolRegistry>,
+    before_tool_call: Option<BeforeToolCallHook>,
 }
 
 impl ToolNode {
     pub fn new(registry: Arc<ToolRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            before_tool_call: None,
+        }
+    }
+
+    /// Set a hook that runs before each tool call.
+    ///
+    /// The hook receives `(tool_name, args)` and returns whether to proceed
+    /// or deny the call. Denied calls produce an error tool result that the
+    /// LLM can see and react to.
+    pub fn with_before_hook(mut self, hook: BeforeToolCallHook) -> Self {
+        self.before_tool_call = Some(hook);
+        self
     }
 }
 
@@ -152,6 +187,21 @@ impl<S: ToolCallState> Node<S> for ToolNode {
         let mut results = Vec::with_capacity(pending.len());
 
         for call in pending {
+            // Run before-hook if configured
+            if let Some(hook) = &self.before_tool_call {
+                match hook(&call.name, &call.args) {
+                    BeforeToolCallAction::Proceed => {}
+                    BeforeToolCallAction::Deny(reason) => {
+                        results.push(ToolResult {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            result: Err(reason),
+                        });
+                        continue;
+                    }
+                }
+            }
+
             let result = match self.registry.call(&call.name, call.args.clone()).await {
                 Ok(value) => ToolResult {
                     id: call.id.clone(),
