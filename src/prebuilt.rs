@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use crate::error::{GraphError, Result};
 use crate::graph::{CompiledGraph, Graph, Node, NodeOutcome, Reducer, END};
-use crate::tools::{PendingToolCall, ToolCallState, ToolNode, ToolRegistry, ToolResult};
+use crate::tools::{
+    BeforeToolCallHook, PendingToolCall, ToolCallState, ToolNode, ToolRegistry, ToolResult,
+};
 
 // ---------------------------------------------------------------------------
 // AgentMessage — typed conversation history
@@ -55,6 +57,17 @@ impl AgentState {
             pending_tool_calls: vec![],
             is_done: false,
         }
+    }
+
+    /// Continue from a completed state with a new user message.
+    ///
+    /// Preserves the full conversation history and resets `is_done`
+    /// so the graph can run another turn.
+    pub fn continue_with(mut self, user_message: impl Into<String>) -> Self {
+        self.messages.push(AgentMessage::User(user_message.into()));
+        self.pending_tool_calls.clear();
+        self.is_done = false;
+        self
     }
 
     /// Get the final assistant response, if the agent is done.
@@ -175,10 +188,9 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
              When done, respond normally with no TOOL_CALL.\n\nTools:\n{tool_descriptions}"
         );
 
-        // Build the prompt from the last relevant message
-        let prompt = self.build_prompt(state);
+        // Build full conversation history for the LLM
+        let (prompt, history) = self.build_conversation(state, &tool_instructions);
 
-        let history = vec![RigMessage::system(&tool_instructions)];
         let response = self
             .agent
             .chat(&prompt, history)
@@ -220,43 +232,64 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
 }
 
 impl<M: CompletionModel> ReactAgentNode<M> {
-    fn build_prompt(&self, state: &AgentState) -> String {
-        // If the last message is a tool result, summarize recent tool results
-        let last_is_tool_result = matches!(
-            state.messages.last(),
-            Some(AgentMessage::ToolResult { .. })
-        );
+    /// Build the full conversation for the LLM from agent state.
+    ///
+    /// Returns (current_prompt, chat_history) where history contains
+    /// the tool instructions and all prior messages.
+    fn build_conversation(
+        &self,
+        state: &AgentState,
+        tool_instructions: &str,
+    ) -> (String, Vec<RigMessage>) {
+        let mut history = vec![RigMessage::system(tool_instructions)];
 
-        if last_is_tool_result {
-            let results: Vec<String> = state
-                .messages
-                .iter()
-                .rev()
-                .take_while(|m| matches!(m, AgentMessage::ToolResult { .. }))
-                .map(|m| match m {
-                    AgentMessage::ToolResult { name, result, .. } => {
-                        format!("Tool '{name}' returned: {result}")
-                    }
-                    _ => unreachable!(),
-                })
-                .collect();
-
-            format!(
-                "{}\n\nProvide your final answer or call another tool.",
-                results.into_iter().rev().collect::<Vec<_>>().join("\n")
-            )
-        } else {
-            // Find the last user message
-            state
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| match m {
-                    AgentMessage::User(text) => Some(text.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default()
+        // Convert all messages except the last into chat history.
+        // The last message becomes the prompt.
+        if state.messages.is_empty() {
+            return (String::new(), history);
         }
+
+        let (earlier, last) = state.messages.split_at(state.messages.len() - 1);
+
+        for msg in earlier {
+            match msg {
+                AgentMessage::User(text) => {
+                    history.push(RigMessage::user(text));
+                }
+                AgentMessage::Assistant(text) => {
+                    history.push(RigMessage::assistant(text));
+                }
+                AgentMessage::ToolCall { name, args, .. } => {
+                    let args_str = serde_json::to_string(args).unwrap_or_default();
+                    history.push(RigMessage::assistant(format!(
+                        "TOOL_CALL: {name}({args_str})"
+                    )));
+                }
+                AgentMessage::ToolResult { name, result, .. } => {
+                    history.push(RigMessage::user(format!(
+                        "[Tool result for '{name}']: {result}"
+                    )));
+                }
+            }
+        }
+
+        // The last message becomes the prompt
+        let prompt = match &last[0] {
+            AgentMessage::User(text) => text.clone(),
+            AgentMessage::Assistant(text) => text.clone(),
+            AgentMessage::ToolResult { name, result, .. } => {
+                format!(
+                    "[Tool result for '{name}']: {result}\n\n\
+                     Provide your final answer or call another tool."
+                )
+            }
+            AgentMessage::ToolCall { name, args, .. } => {
+                let args_str = serde_json::to_string(args).unwrap_or_default();
+                format!("TOOL_CALL: {name}({args_str})")
+            }
+        };
+
+        (prompt, history)
     }
 }
 
@@ -280,10 +313,50 @@ impl<M: CompletionModel> ReactAgentNode<M> {
 /// let executor = Executor::new(graph).max_steps(20);
 /// let outcome = executor.run(AgentState::new("Hello"), "thread-1").await?;
 /// ```
+///
+/// For multi-turn conversations, use [`AgentState::continue_with`]:
+///
+/// ```ignore
+/// let state = AgentState::new("What files are here?");
+/// let outcome = executor.run(state, "thread-1").await?;
+/// if let RunOutcome::Completed(state) = outcome {
+///     let state = state.continue_with("Now read the README");
+///     let outcome = executor.run(state, "thread-1").await?;
+/// }
+/// ```
 pub fn create_react_agent<M: CompletionModel + 'static>(
     model: M,
     tools: ToolRegistry,
     system_prompt: impl Into<String>,
+) -> Result<CompiledGraph<AgentState>> {
+    create_react_agent_with_hooks(model, tools, system_prompt, None)
+}
+
+/// Build a ReAct agent graph with an optional before-tool-call hook.
+///
+/// The hook runs before each tool execution and can approve or deny calls.
+/// See [`BeforeToolCallHook`] for details.
+///
+/// ```ignore
+/// use metalcraft::{create_react_agent_with_hooks, BeforeToolCallAction};
+/// use std::sync::Arc;
+///
+/// let hook = Arc::new(|name: &str, args: &serde_json::Value| {
+///     if name == "bash" {
+///         // prompt user...
+///         BeforeToolCallAction::Proceed
+///     } else {
+///         BeforeToolCallAction::Proceed
+///     }
+/// });
+///
+/// let graph = create_react_agent_with_hooks(model, tools, "prompt", Some(hook))?;
+/// ```
+pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
+    model: M,
+    tools: ToolRegistry,
+    system_prompt: impl Into<String>,
+    before_tool_call: Option<BeforeToolCallHook>,
 ) -> Result<CompiledGraph<AgentState>> {
     let registry = Arc::new(tools);
 
@@ -292,7 +365,10 @@ pub fn create_react_agent<M: CompletionModel + 'static>(
         .build();
 
     let agent_node = ReactAgentNode::new(agent, registry.clone());
-    let tool_node = ToolNode::new(registry);
+    let mut tool_node = ToolNode::new(registry);
+    if let Some(hook) = before_tool_call {
+        tool_node = tool_node.with_before_hook(hook);
+    }
 
     Graph::<AgentState>::new()
         .add_node("agent", agent_node)

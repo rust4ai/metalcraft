@@ -1,6 +1,6 @@
 [package]
 name = "metalcraft"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A LangGraph-style stateful graph orchestrator for AI agents in Rust"
 license = "MIT"
