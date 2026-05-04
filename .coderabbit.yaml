@@ -1,0 +1,11 @@
+reviews:
+    auto_review:
+      enabled: true
+      base_branches:
+        - main
+        - develop
+    path_filters:
+      - "!dist/**"
+      - "!*.lock"
+  language: en
+  tone_instructions: "Be concise and actionable"
