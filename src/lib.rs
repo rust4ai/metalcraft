@@ -11,6 +11,7 @@ mod graph;
 mod executor;
 mod checkpoint;
 mod error;
+pub mod events;
 pub mod tools;
 
 #[cfg(feature = "rig")]
@@ -20,6 +21,7 @@ pub use error::{GraphError, Result};
 pub use graph::{Graph, CompiledGraph, Edge, Node, NodeOutcome, Reducer, SubgraphNode, START, END};
 pub use executor::{Executor, GuardAction, StepEvent, StepGuard, RunOutcome};
 pub use checkpoint::{Checkpointer, MemoryCheckpointer};
+pub use events::{StreamEvent, EventSender, EventReceiver, event_channel};
 pub use tools::{
     Tool, ToolRegistry, PendingToolCall, ToolResult, ToolCallState, ToolNode,
     BeforeToolCallAction, BeforeToolCallHook,

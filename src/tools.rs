@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{GraphError, Result};
+use crate::events::{emit, EventSender, StreamEvent};
 use crate::graph::{Node, NodeOutcome, Reducer};
 
 // ---------------------------------------------------------------------------
@@ -132,6 +133,12 @@ pub trait ToolCallState: Reducer {
 
     /// Produce a state update that records the given tool results.
     fn tool_results_update(results: Vec<ToolResult>) -> Self::Update;
+
+    /// Optional event sender for streaming. Override to enable tool-level
+    /// streaming events. Default returns `None`.
+    fn event_sender(&self) -> Option<&EventSender> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +196,7 @@ impl ToolNode {
 impl<S: ToolCallState> Node<S> for ToolNode {
     async fn run(&self, state: &S) -> Result<NodeOutcome<S::Update>> {
         let pending = state.pending_tool_calls();
+        let event_tx = state.event_sender();
         let mut results = Vec::with_capacity(pending.len());
 
         for call in pending {
@@ -208,6 +216,15 @@ impl<S: ToolCallState> Node<S> for ToolNode {
                 }
             }
 
+            if let Some(tx) = event_tx {
+                emit(tx, StreamEvent::ToolStart {
+                    name: call.name.clone(),
+                    call_id: call.id.clone(),
+                });
+            }
+
+            let start = std::time::Instant::now();
+
             let result = match self.registry.call(&call.name, call.args.clone()).await {
                 Ok(value) => ToolResult {
                     id: call.id.clone(),
@@ -222,6 +239,16 @@ impl<S: ToolCallState> Node<S> for ToolNode {
                     result: Err(e.to_string()),
                 },
             };
+
+            if let Some(tx) = event_tx {
+                emit(tx, StreamEvent::ToolEnd {
+                    name: result.name.clone(),
+                    call_id: result.id.clone(),
+                    is_error: result.result.is_err(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+
             results.push(result);
         }
 
