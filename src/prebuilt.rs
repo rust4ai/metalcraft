@@ -284,6 +284,7 @@ pub struct ReactAgentNode<M: CompletionModel> {
     model: M,
     system_prompt: String,
     registry: Arc<ToolRegistry>,
+    temperature: Option<f64>,
 }
 
 impl<M: CompletionModel> ReactAgentNode<M> {
@@ -292,7 +293,14 @@ impl<M: CompletionModel> ReactAgentNode<M> {
             model,
             system_prompt,
             registry,
+            temperature: None,
         }
+    }
+
+    /// Set the temperature for LLM completions. Use `0.0` for deterministic output.
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
+        self
     }
 }
 
@@ -326,6 +334,7 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
             .preamble(self.system_prompt.clone())
             .messages(history)
             .tools(tool_defs)
+            .temperature_opt(self.temperature)
             .send()
             .await
             .map_err(|e| GraphError::Node {
@@ -488,9 +497,30 @@ pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
     system_prompt: impl Into<String>,
     before_tool_call: Option<BeforeToolCallHook>,
 ) -> Result<CompiledGraph<AgentState>> {
+    create_react_agent_full(model, tools, system_prompt, before_tool_call, None)
+}
+
+/// Build a ReAct agent graph with full configuration options.
+///
+/// This is the most flexible builder — all other `create_react_agent*` functions
+/// delegate to this one.
+///
+/// # Parameters
+/// - `temperature` — LLM sampling temperature. Use `Some(0.0)` for deterministic
+///   output (recommended for retrieval/RAG agents).
+pub fn create_react_agent_full<M: CompletionModel + 'static>(
+    model: M,
+    tools: ToolRegistry,
+    system_prompt: impl Into<String>,
+    before_tool_call: Option<BeforeToolCallHook>,
+    temperature: Option<f64>,
+) -> Result<CompiledGraph<AgentState>> {
     let registry = Arc::new(tools);
 
-    let agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone());
+    let mut agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone());
+    if let Some(temp) = temperature {
+        agent_node = agent_node.with_temperature(temp);
+    }
     let mut tool_node = ToolNode::new(registry);
     if let Some(hook) = before_tool_call {
         tool_node = tool_node.with_before_hook(hook);

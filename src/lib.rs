@@ -28,7 +28,7 @@ pub use tools::{
 #[cfg(feature = "rig")]
 pub use prebuilt::{
     AgentMessage, AgentState, AgentUpdate, AgentTurn, AgentToolCall, AgentToolResult,
-    ReactAgentNode, create_react_agent, create_react_agent_with_hooks,
+    ReactAgentNode, create_react_agent, create_react_agent_with_hooks, create_react_agent_full,
 };
 
 /// Re-export Rig when the `rig` feature is enabled.
