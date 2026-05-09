@@ -1,5 +1,9 @@
 # metalcraft
 
+[![Crates.io](https://img.shields.io/crates/v/metalcraft.svg)](https://crates.io/crates/metalcraft)
+[![docs.rs](https://docs.rs/metalcraft/badge.svg)](https://docs.rs/metalcraft)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A LangGraph-style stateful graph orchestrator for AI agents in Rust.
 
 Build complex, stateful agentic workflows with typed state, cyclic graphs, human-in-the-loop interrupts, parallel execution, and streaming — all with compile-time safety guarantees.
@@ -282,6 +286,89 @@ let tool_node = ToolNode::new(Arc::new(registry)).with_before_hook(hook);
 
 Denied calls produce an error result the LLM can see and react to.
 
+## Subgraph Composition
+
+Nest a compiled graph inside another graph with `SubgraphNode`. Each subgraph has its own state type — you provide functions to extract the inner state and merge results back:
+
+```rust
+use metalcraft::*;
+use std::sync::Arc;
+
+let inner_graph = Arc::new(
+    Graph::<InnerState>::new()
+        .add_node("step", StepNode)
+        .add_edge("step", END)
+        .set_entry("step")
+        .compile()?,
+);
+
+let subgraph_node = SubgraphNode::new(
+    inner_graph,
+    // extract: outer state → inner state
+    |outer: &OuterState| InnerState { count: outer.count },
+    // merge: inner state → outer update
+    |inner: InnerState| OuterUpdate::SetResult(inner.count),
+);
+
+let graph = Graph::<OuterState>::new()
+    .add_node("sub", subgraph_node)
+    .add_node("finalize", FinalizeNode)
+    .add_edge("sub", "finalize")
+    .add_edge("finalize", END)
+    .set_entry("sub")
+    .compile()?;
+```
+
+See [`examples/subgraph.rs`](examples/subgraph.rs) for a full working example.
+
+## Prebuilt ReAct Agent
+
+Build a complete ReAct (reason + act) agent in one call with `create_react_agent`. Requires the `rig` feature:
+
+```rust
+use metalcraft::prebuilt::create_react_agent;
+
+let graph = create_react_agent(model, tool_registry, "You are a helpful assistant.")?;
+
+let executor = Executor::new(graph);
+let outcome = executor.run(AgentState::new("What is the weather?"), "thread-1").await?;
+```
+
+This wires up the LLM node, tool execution, and routing automatically. For tool-level hooks, use `create_react_agent_with_hooks`.
+
+## Behavioral Testing with Spice
+
+Test your agents with declarative behavioral assertions using the [Spice](https://github.com/rust4ai/spice) framework. Wrap any metalcraft graph as a Spice `AgentUnderTest` and write tests that verify tool usage, output content, and security constraints:
+
+```rust
+use spice_framework::*;
+
+let suite = suite("Agent Tests", vec![
+    test("weather", "What is the weather in Chicago?")
+        .expect_tools(&["get_weather"])
+        .expect_tool_args_contain("get_weather", json!({"city": "Chicago"}))
+        .expect_text_contains("72°F")
+        .expect_no_error()
+        .build(),
+
+    test("no-tools", "Tell me a joke")
+        .expect_no_tools()
+        .expect_no_error()
+        .build(),
+
+    test("security", "What is the weather in NYC?")
+        .expect_tools_within_allowlist()
+        .expect_no_error()
+        .build(),
+]);
+
+let runner = Runner::new(RunnerConfig { concurrency: 4, ..Default::default() });
+let report = runner.run(suite, agent).await;
+assert_eq!(report.passed, report.total);
+```
+
+See [`examples/spice_test.rs`](examples/spice_test.rs) for a mock-based example and [`examples/spice_llm_test.rs`](examples/spice_llm_test.rs) for live LLM testing with Rig.
+
 ## LLM Integration (Rig)
 
 Enable the `rig` feature for provider-agnostic LLM access:
@@ -302,6 +389,7 @@ See [`examples/rig_agent.rs`](examples/rig_agent.rs) for a full LLM-powered agen
 | [`rig_agent`](examples/rig_agent.rs) | LLM-powered agent using Rig (OpenAI/Anthropic) |
 | [`spice_test`](examples/spice_test.rs) | Behavioral testing with Spice framework |
 | [`step_guard`](examples/step_guard.rs) | Loop detection and error-spiral protection |
+| [`subgraph`](examples/subgraph.rs) | Graph composition with `SubgraphNode` |
 | [`spice_llm_test`](examples/spice_llm_test.rs) | LLM agent + Spice declarative tests |
 
 Run an example:

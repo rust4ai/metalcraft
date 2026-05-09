@@ -11,6 +11,7 @@ use rig::completion::{AssistantContent, CompletionModel, Message as RigMessage, 
 use std::sync::Arc;
 
 use crate::error::{GraphError, Result};
+use crate::events::{emit, EventSender, StreamEvent};
 use crate::graph::{CompiledGraph, Graph, Node, NodeOutcome, Reducer, END};
 use crate::tools::{
     BeforeToolCallHook, PendingToolCall, ToolCallState, ToolNode, ToolRegistry, ToolResult,
@@ -76,11 +77,23 @@ pub enum AgentMessage {
 // ---------------------------------------------------------------------------
 
 /// State for a ReAct agent built with [`create_react_agent`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentState {
     pub messages: Vec<AgentMessage>,
     pub pending_tool_calls: Vec<PendingToolCall>,
     pub is_done: bool,
+    event_tx: Option<EventSender>,
+}
+
+impl std::fmt::Debug for AgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentState")
+            .field("messages", &self.messages)
+            .field("pending_tool_calls", &self.pending_tool_calls)
+            .field("is_done", &self.is_done)
+            .field("has_event_tx", &self.event_tx.is_some())
+            .finish()
+    }
 }
 
 impl AgentState {
@@ -90,13 +103,20 @@ impl AgentState {
             messages: vec![AgentMessage::User(user_message.into())],
             pending_tool_calls: vec![],
             is_done: false,
+            event_tx: None,
         }
+    }
+
+    /// Attach an event sender for streaming events during execution.
+    pub fn with_events(mut self, tx: EventSender) -> Self {
+        self.event_tx = Some(tx);
+        self
     }
 
     /// Continue from a completed state with a new user message.
     ///
-    /// Preserves the full conversation history and resets `is_done`
-    /// so the graph can run another turn.
+    /// Preserves the full conversation history, event sender, and resets
+    /// `is_done` so the graph can run another turn.
     pub fn continue_with(mut self, user_message: impl Into<String>) -> Self {
         self.messages.push(AgentMessage::User(user_message.into()));
         self.pending_tool_calls.clear();
@@ -269,6 +289,10 @@ impl ToolCallState for AgentState {
     fn tool_results_update(results: Vec<ToolResult>) -> AgentUpdate {
         AgentUpdate::ToolResults(results)
     }
+
+    fn event_sender(&self) -> Option<&EventSender> {
+        self.event_tx.as_ref()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +308,7 @@ pub struct ReactAgentNode<M: CompletionModel> {
     model: M,
     system_prompt: String,
     registry: Arc<ToolRegistry>,
+    temperature: Option<f64>,
 }
 
 impl<M: CompletionModel> ReactAgentNode<M> {
@@ -292,7 +317,14 @@ impl<M: CompletionModel> ReactAgentNode<M> {
             model,
             system_prompt,
             registry,
+            temperature: None,
         }
+    }
+
+    /// Set the temperature for LLM completions. Use `0.0` for deterministic output.
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
+        self
     }
 }
 
@@ -320,17 +352,27 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
         // Build conversation history
         let (prompt, history) = self.build_conversation(state);
 
+        if let Some(tx) = &state.event_tx {
+            emit(tx, StreamEvent::LlmStart);
+        }
+
         let response = self
             .model
             .completion_request(prompt)
             .preamble(self.system_prompt.clone())
             .messages(history)
             .tools(tool_defs)
+            .temperature_opt(self.temperature)
             .send()
             .await
-            .map_err(|e| GraphError::Node {
-                node: "agent".into(),
-                message: e.to_string(),
+            .map_err(|e| {
+                if let Some(tx) = &state.event_tx {
+                    emit(tx, StreamEvent::Error { message: e.to_string() });
+                }
+                GraphError::Node {
+                    node: "agent".into(),
+                    message: e.to_string(),
+                }
             })?;
 
         // Parse response: extract tool calls and text from AssistantContent
@@ -356,8 +398,15 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
 
         if tool_calls.is_empty() {
             let final_text = text_parts.join("\n");
+            if let Some(tx) = &state.event_tx {
+                emit(tx, StreamEvent::LlmEnd { tool_calls: 0, has_answer: true });
+                emit(tx, StreamEvent::Done { answer: final_text.clone() });
+            }
             Ok(NodeOutcome::Update(AgentUpdate::FinalAnswer(final_text)))
         } else {
+            if let Some(tx) = &state.event_tx {
+                emit(tx, StreamEvent::LlmEnd { tool_calls: tool_calls.len(), has_answer: false });
+            }
             Ok(NodeOutcome::Update(AgentUpdate::ToolCalls(tool_calls)))
         }
     }
@@ -488,9 +537,30 @@ pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
     system_prompt: impl Into<String>,
     before_tool_call: Option<BeforeToolCallHook>,
 ) -> Result<CompiledGraph<AgentState>> {
+    create_react_agent_full(model, tools, system_prompt, before_tool_call, None)
+}
+
+/// Build a ReAct agent graph with full configuration options.
+///
+/// This is the most flexible builder — all other `create_react_agent*` functions
+/// delegate to this one.
+///
+/// # Parameters
+/// - `temperature` — LLM sampling temperature. Use `Some(0.0)` for deterministic
+///   output (recommended for retrieval/RAG agents).
+pub fn create_react_agent_full<M: CompletionModel + 'static>(
+    model: M,
+    tools: ToolRegistry,
+    system_prompt: impl Into<String>,
+    before_tool_call: Option<BeforeToolCallHook>,
+    temperature: Option<f64>,
+) -> Result<CompiledGraph<AgentState>> {
     let registry = Arc::new(tools);
 
-    let agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone());
+    let mut agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone());
+    if let Some(temp) = temperature {
+        agent_node = agent_node.with_temperature(temp);
+    }
     let mut tool_node = ToolNode::new(registry);
     if let Some(hook) = before_tool_call {
         tool_node = tool_node.with_before_hook(hook);
