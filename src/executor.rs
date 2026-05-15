@@ -19,6 +19,21 @@ pub struct StepEvent {
     pub node: String,
     /// The next node to run (or END, or "__interrupted__").
     pub next: String,
+    /// Wall-clock duration of this node's execution.
+    pub duration: std::time::Duration,
+    /// Whether the node completed successfully, was interrupted, or errored.
+    pub outcome: StepOutcome,
+}
+
+/// Outcome of a single node execution.
+#[derive(Debug, Clone)]
+pub enum StepOutcome {
+    /// Node completed successfully and produced an update.
+    Success,
+    /// Node requested an interrupt.
+    Interrupted { reason: String },
+    /// Node failed with an error.
+    Failed { error: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -62,11 +77,32 @@ pub enum GuardAction {
 /// that just ran, and the next node. Can halt execution early.
 pub type StepGuard<S> = Arc<dyn Fn(&S, &StepEvent) -> GuardAction + Send + Sync>;
 
+/// An async observer called after each node execution with rich diagnostics.
+/// Purely observational — cannot halt execution. Errors are logged but ignored.
+#[async_trait::async_trait]
+pub trait StepObserver<S: Reducer>: Send + Sync {
+    async fn on_step(&self, state: &S, event: &StepEvent);
+}
+
+/// Blanket impl: async closures work as observers.
+#[async_trait::async_trait]
+impl<S, F, Fut> StepObserver<S> for F
+where
+    S: Reducer,
+    F: Fn(StepEvent) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    async fn on_step(&self, _state: &S, event: &StepEvent) {
+        (self)(event.clone()).await;
+    }
+}
+
 pub struct Executor<S: Reducer> {
     graph: Arc<CompiledGraph<S>>,
     checkpointer: Option<Arc<dyn Checkpointer<S>>>,
     max_steps: usize,
     step_guard: Option<StepGuard<S>>,
+    observer: Option<Arc<dyn StepObserver<S>>>,
 }
 
 impl<S: Reducer> Executor<S> {
@@ -76,6 +112,7 @@ impl<S: Reducer> Executor<S> {
             checkpointer: None,
             max_steps: 100,
             step_guard: None,
+            observer: None,
         }
     }
 
@@ -87,6 +124,7 @@ impl<S: Reducer> Executor<S> {
             checkpointer: None,
             max_steps: 100,
             step_guard: None,
+            observer: None,
         }
     }
 
@@ -112,6 +150,13 @@ impl<S: Reducer> Executor<S> {
         self
     }
 
+    /// Attach a step observer for diagnostics. Called after each node
+    /// execution with timing and outcome info. Does not affect control flow.
+    pub fn with_observer<O: StepObserver<S> + 'static>(mut self, observer: O) -> Self {
+        self.observer = Some(Arc::new(observer));
+        self
+    }
+
     /// Run the graph to completion (or interruption).
     pub async fn run(&self, mut state: S, thread_id: &str) -> Result<RunOutcome<S>> {
         let mut current = self.graph.entry.clone();
@@ -121,14 +166,26 @@ impl<S: Reducer> Executor<S> {
                 return Ok(RunOutcome::Completed(state));
             }
 
-            match self.execute_step(&mut state, &current, step).await? {
-                StepResult::Continue(next) => {
+            let started = std::time::Instant::now();
+            let step_result = self.execute_step(&mut state, &current, step).await;
+            let duration = started.elapsed();
+
+            match step_result {
+                Ok(StepResult::Continue(next)) => {
+                    let event = StepEvent {
+                        node: current.clone(),
+                        next: next.clone(),
+                        duration,
+                        outcome: StepOutcome::Success,
+                    };
+
+                    // Notify observer
+                    if let Some(obs) = &self.observer {
+                        obs.on_step(&state, &event).await;
+                    }
+
                     // Run step guard
                     if let Some(guard) = &self.step_guard {
-                        let event = StepEvent {
-                            node: current.clone(),
-                            next: next.clone(),
-                        };
                         if let GuardAction::Stop(reason) = guard(&state, &event) {
                             if let Some(cp) = &self.checkpointer {
                                 cp.save(thread_id, &state, &next).await?;
@@ -146,10 +203,20 @@ impl<S: Reducer> Executor<S> {
                     }
                     current = next;
                 }
-                StepResult::Interrupt {
+                Ok(StepResult::Interrupt {
                     reason,
                     resume_from,
-                } => {
+                }) => {
+                    let event = StepEvent {
+                        node: current.clone(),
+                        next: resume_from.clone(),
+                        duration,
+                        outcome: StepOutcome::Interrupted { reason: reason.clone() },
+                    };
+                    if let Some(obs) = &self.observer {
+                        obs.on_step(&state, &event).await;
+                    }
+
                     if let Some(cp) = &self.checkpointer {
                         cp.save(thread_id, &state, &resume_from).await?;
                     }
@@ -158,6 +225,18 @@ impl<S: Reducer> Executor<S> {
                         reason,
                         resume_from,
                     });
+                }
+                Err(e) => {
+                    let event = StepEvent {
+                        node: current.clone(),
+                        next: String::new(),
+                        duration,
+                        outcome: StepOutcome::Failed { error: e.to_string() },
+                    };
+                    if let Some(obs) = &self.observer {
+                        obs.on_step(&state, &event).await;
+                    }
+                    return Err(e);
                 }
             }
         }
@@ -195,13 +274,22 @@ impl<S: Reducer> Executor<S> {
                 return Ok(RunOutcome::Completed(state));
             }
 
-            match self.execute_step(&mut state, &current, step).await? {
-                StepResult::Continue(next) => {
+            let started = std::time::Instant::now();
+            let step_result = self.execute_step(&mut state, &current, step).await;
+            let duration = started.elapsed();
+
+            match step_result {
+                Ok(StepResult::Continue(next)) => {
+                    let event = StepEvent {
+                        node: current.clone(),
+                        next: next.clone(),
+                        duration,
+                        outcome: StepOutcome::Success,
+                    };
+                    if let Some(obs) = &self.observer {
+                        obs.on_step(&state, &event).await;
+                    }
                     if let Some(guard) = &self.step_guard {
-                        let event = StepEvent {
-                            node: current.clone(),
-                            next: next.clone(),
-                        };
                         if let GuardAction::Stop(reason) = guard(&state, &event) {
                             cp.save(thread_id, &state, &next).await?;
                             return Ok(RunOutcome::Interrupted {
@@ -214,16 +302,37 @@ impl<S: Reducer> Executor<S> {
                     cp.save(thread_id, &state, &next).await?;
                     current = next;
                 }
-                StepResult::Interrupt {
+                Ok(StepResult::Interrupt {
                     reason,
                     resume_from,
-                } => {
+                }) => {
+                    let event = StepEvent {
+                        node: current.clone(),
+                        next: resume_from.clone(),
+                        duration,
+                        outcome: StepOutcome::Interrupted { reason: reason.clone() },
+                    };
+                    if let Some(obs) = &self.observer {
+                        obs.on_step(&state, &event).await;
+                    }
                     cp.save(thread_id, &state, &resume_from).await?;
                     return Ok(RunOutcome::Interrupted {
                         state,
                         reason,
                         resume_from,
                     });
+                }
+                Err(e) => {
+                    let event = StepEvent {
+                        node: current.clone(),
+                        next: String::new(),
+                        duration,
+                        outcome: StepOutcome::Failed { error: e.to_string() },
+                    };
+                    if let Some(obs) = &self.observer {
+                        obs.on_step(&state, &event).await;
+                    }
+                    return Err(e);
                 }
             }
         }
@@ -248,6 +357,7 @@ impl<S: Reducer> Executor<S> {
                     break;
                 }
 
+                let started = std::time::Instant::now();
                 match self.execute_step(&mut state, &current, step).await {
                     Ok(StepResult::Continue(next)) => {
                         if let Some(cp) = &self.checkpointer {
@@ -260,6 +370,8 @@ impl<S: Reducer> Executor<S> {
                         let event = StepEvent {
                             node: current.clone(),
                             next: next.clone(),
+                            duration: started.elapsed(),
+                            outcome: StepOutcome::Success,
                         };
                         if tx.send(Ok((event, state.clone()))).await.is_err() {
                             return;
@@ -270,6 +382,8 @@ impl<S: Reducer> Executor<S> {
                         let event = StepEvent {
                             node: current.clone(),
                             next: "__interrupted__".to_string(),
+                            duration: started.elapsed(),
+                            outcome: StepOutcome::Interrupted { reason: "interrupted".into() },
                         };
                         let _ = tx.send(Ok((event, state.clone()))).await;
                         if let Some(cp) = &self.checkpointer {

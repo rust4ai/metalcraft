@@ -14,6 +14,7 @@ Build complex, stateful agentic workflows with typed state, cyclic graphs, human
 - **Async streaming** — Stream step-by-step execution events in real time.
 - **Tool registry** — Define tools once, export to Anthropic or OpenAI format.
 - **Before-tool hooks** — Approve, deny, or log tool calls before execution via `BeforeToolCallHook`.
+- **Step observers** — Async diagnostics hooks with per-node timing, outcome, and custom detail reporting.
 - **Step guards** — Executor-level callbacks to detect loops, error spirals, or enforce custom policies.
 - **Native tool calling** — Rig integration uses structured `ToolDefinition` and `AssistantContent::ToolCall`, not string parsing.
 - **LLM integration** — Optional [Rig](https://docs.rig.rs) support for provider-agnostic model access.
@@ -261,6 +262,37 @@ let executor = Executor::new(graph)
 
 Guards return `RunOutcome::Interrupted`, so execution is resumable. See [`examples/step_guard.rs`](examples/step_guard.rs) for a full example with loop detection.
 
+## Step Observers
+
+Attach async observers for diagnostics, logging, or metrics. Observers receive the current state and a `StepEvent` with timing and outcome after each node executes. They cannot affect control flow.
+
+```rust
+use metalcraft::*;
+use async_trait::async_trait;
+
+struct MetricsObserver;
+
+#[async_trait]
+impl StepObserver<MyState> for MetricsObserver {
+    async fn on_step(&self, state: &MyState, event: &StepEvent) {
+        println!(
+            "node={} duration={:?} outcome={:?}",
+            event.node, event.duration, event.outcome
+        );
+    }
+}
+
+let executor = Executor::new(graph)
+    .with_observer(MetricsObserver)
+    .max_steps(20);
+```
+
+`StepEvent` includes:
+- `node` — name of the node that just ran
+- `next` — the next node (or `END`)
+- `duration` — wall-clock `Duration` of the node execution
+- `outcome` — `StepOutcome::Success`, `Interrupted { reason }`, or `Failed { error }`
+
 ## Before-Tool Hooks
 
 Approve or deny tool calls before execution:
@@ -338,6 +370,11 @@ cargo run --example agent_loop
 │  │  StepGuard   │  │ BeforeToolCallHook  │        │
 │  │ loop/error   │  │  approve / deny     │        │
 │  └──────────────┘  └─────────────────────┘        │
+│                                                   │
+│  ┌────────────────┐                               │
+│  │ StepObserver   │                               │
+│  │ async logging  │                               │
+│  └────────────────┘                               │
 └──────────────────────────────────────────────────┘
 
 State: Reducer trait + typed Update enum
