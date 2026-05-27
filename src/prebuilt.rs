@@ -17,6 +17,26 @@ use crate::tools::{
 };
 
 // ---------------------------------------------------------------------------
+// LlmCallHook — observe the raw context sent to the LLM each turn
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the full context sent to the LLM in a single call.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LlmCallSnapshot {
+    /// The system prompt (preamble).
+    pub system_prompt: String,
+    /// The prompt message (last message, sent as the main user turn).
+    pub prompt: serde_json::Value,
+    /// Chat history preceding the prompt.
+    pub history: Vec<serde_json::Value>,
+    /// Tool definitions available to the model.
+    pub tools: Vec<serde_json::Value>,
+}
+
+/// Hook called with the raw LLM request context before each `.send()`.
+pub type LlmCallHook = Arc<dyn Fn(&LlmCallSnapshot) + Send + Sync>;
+
+// ---------------------------------------------------------------------------
 // AgentTurn — structured turn data extracted from message history
 // ---------------------------------------------------------------------------
 
@@ -96,8 +116,36 @@ impl AgentState {
     /// Continue from a completed state with a new user message.
     ///
     /// Preserves the full conversation history and resets `is_done`
-    /// so the graph can run another turn.
+    /// so the graph can run another turn. Any orphaned tool calls
+    /// (calls without matching results, e.g. from a guard interruption)
+    /// get synthetic "interrupted" results so the API sees a valid
+    /// conversation sequence.
     pub fn continue_with(mut self, user_message: impl Into<String>) -> Self {
+        // Patch orphaned tool calls: collect IDs that have a ToolCall but no ToolResult.
+        let mut unmatched: Vec<(String, Option<String>, String)> = Vec::new();
+        let mut matched_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for msg in &self.messages {
+            match msg {
+                AgentMessage::ToolCall { id, call_id, name, .. } => {
+                    unmatched.push((id.clone(), call_id.clone(), name.clone()));
+                }
+                AgentMessage::ToolResult { id, .. } => {
+                    matched_ids.insert(id.clone());
+                }
+                _ => {}
+            }
+        }
+        for (id, call_id, name) in unmatched {
+            if !matched_ids.contains(&id) {
+                self.messages.push(AgentMessage::ToolResult {
+                    id,
+                    call_id,
+                    name,
+                    result: "ERROR: interrupted by user".to_string(),
+                });
+            }
+        }
+
         self.messages.push(AgentMessage::User(user_message.into()));
         self.pending_tool_calls.clear();
         self.is_done = false;
@@ -284,6 +332,7 @@ pub struct ReactAgentNode<M: CompletionModel> {
     model: M,
     system_prompt: String,
     registry: Arc<ToolRegistry>,
+    llm_call_hook: Option<LlmCallHook>,
 }
 
 impl<M: CompletionModel> ReactAgentNode<M> {
@@ -292,7 +341,14 @@ impl<M: CompletionModel> ReactAgentNode<M> {
             model,
             system_prompt,
             registry,
+            llm_call_hook: None,
         }
+    }
+
+    /// Attach a hook that observes the raw context sent to the LLM each turn.
+    pub fn with_llm_call_hook(mut self, hook: LlmCallHook) -> Self {
+        self.llm_call_hook = Some(hook);
+        self
     }
 }
 
@@ -319,6 +375,23 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
 
         // Build conversation history
         let (prompt, history) = self.build_conversation(state);
+
+        // Fire the LLM call hook with the full raw context
+        if let Some(ref hook) = self.llm_call_hook {
+            let snapshot = LlmCallSnapshot {
+                system_prompt: self.system_prompt.clone(),
+                prompt: serde_json::to_value(&prompt).unwrap_or_default(),
+                history: history
+                    .iter()
+                    .map(|m| serde_json::to_value(m).unwrap_or_default())
+                    .collect(),
+                tools: tool_defs
+                    .iter()
+                    .map(|t| serde_json::to_value(t).unwrap_or_default())
+                    .collect(),
+            };
+            hook(&snapshot);
+        }
 
         let response = self
             .model
@@ -475,22 +548,28 @@ pub fn create_react_agent<M: CompletionModel + 'static>(
     tools: ToolRegistry,
     system_prompt: impl Into<String>,
 ) -> Result<CompiledGraph<AgentState>> {
-    create_react_agent_with_hooks(model, tools, system_prompt, None)
+    create_react_agent_with_hooks(model, tools, system_prompt, None, None)
 }
 
-/// Build a ReAct agent graph with an optional before-tool-call hook.
+/// Build a ReAct agent graph with optional hooks.
 ///
-/// The hook runs before each tool execution and can approve or deny calls.
-/// See [`BeforeToolCallHook`] for details.
+/// - `before_tool_call`: runs before each tool execution; can approve or deny calls.
+/// - `llm_call_hook`: observes the raw context sent to the LLM each turn.
+///
+/// See [`BeforeToolCallHook`] and [`LlmCallHook`] for details.
 pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
     model: M,
     tools: ToolRegistry,
     system_prompt: impl Into<String>,
     before_tool_call: Option<BeforeToolCallHook>,
+    llm_call_hook: Option<LlmCallHook>,
 ) -> Result<CompiledGraph<AgentState>> {
     let registry = Arc::new(tools);
 
-    let agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone());
+    let mut agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone());
+    if let Some(hook) = llm_call_hook {
+        agent_node = agent_node.with_llm_call_hook(hook);
+    }
     let mut tool_node = ToolNode::new(registry);
     if let Some(hook) = before_tool_call {
         tool_node = tool_node.with_before_hook(hook);
