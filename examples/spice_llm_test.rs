@@ -243,6 +243,9 @@ impl AgentUnderTest for TestAgent {
             RunOutcome::Interrupted { reason, .. } => {
                 Err(SpiceError::AgentError(format!("interrupted: {reason}")))
             }
+            RunOutcome::Failed { node, error, .. } => {
+                Err(SpiceError::AgentError(format!("failed at {node}: {error}")))
+            }
         }
     }
 

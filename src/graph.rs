@@ -295,6 +295,13 @@ impl<SOuter: Reducer, SInner: Reducer> Node<SOuter> for SubgraphNode<SOuter, SIn
                     reason,
                 ))
             }
+            // Surface an inner-graph failure as a node error so the outer
+            // executor returns its own `Failed` (carrying the outer partial
+            // state) rather than swallowing it.
+            RunOutcome::Failed { node, error, .. } => Err(GraphError::Node {
+                node: format!("__subgraph__/{node}"),
+                message: error,
+            }),
         }
     }
 }

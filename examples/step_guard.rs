@@ -201,6 +201,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             println!("Tool calls made: {}", state.tool_calls.len());
             println!("Errors: {}", state.errors);
         }
+        RunOutcome::Failed { node, error, state } => {
+            println!("\n=== Agent failed at {node}: {error} ===");
+            println!("Tool calls made: {}", state.tool_calls.len());
+        }
     }
 
     Ok(())

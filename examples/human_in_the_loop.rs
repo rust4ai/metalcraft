@@ -138,6 +138,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             println!("\n  (completed unexpectedly)");
             return Ok(());
         }
+        RunOutcome::Failed { node, error, .. } => {
+            println!("\n  ✗ FAILED at {node}: {error}");
+            return Ok(());
+        }
     }
 
     // --- Simulate human approval ---
@@ -155,6 +159,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
         RunOutcome::Interrupted { reason, .. } => {
             println!("\n  ⏸ Interrupted again: {reason}");
+        }
+        RunOutcome::Failed { node, error, .. } => {
+            println!("\n  ✗ Failed at {node}: {error}");
         }
     }
 

@@ -51,6 +51,17 @@ pub enum RunOutcome<S> {
         /// The node that will re-run when resumed.
         resume_from: String,
     },
+    /// A node failed. Carries the state accumulated up to the failure (every
+    /// successful node's update was already applied) so callers can inspect or
+    /// persist partial progress, alongside the error message. Previously a
+    /// node failure surfaced as `Err(GraphError)` and the partial state was
+    /// dropped; this variant preserves it.
+    Failed {
+        state: S,
+        /// The node that failed.
+        node: String,
+        error: String,
+    },
 }
 
 /// Internal result from executing a single step.
@@ -236,7 +247,14 @@ impl<S: Reducer> Executor<S> {
                     if let Some(obs) = &self.observer {
                         obs.on_step(&state, &event).await;
                     }
-                    return Err(e);
+                    // Hand back the partial state instead of dropping it on the
+                    // floor — the caller can persist or inspect what the graph
+                    // accumulated before the failing node.
+                    return Ok(RunOutcome::Failed {
+                        state,
+                        node: current,
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -332,7 +350,11 @@ impl<S: Reducer> Executor<S> {
                     if let Some(obs) = &self.observer {
                         obs.on_step(&state, &event).await;
                     }
-                    return Err(e);
+                    return Ok(RunOutcome::Failed {
+                        state,
+                        node: current,
+                        error: e.to_string(),
+                    });
                 }
             }
         }

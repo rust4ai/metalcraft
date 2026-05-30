@@ -268,6 +268,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             RunOutcome::Interrupted { reason, .. } => {
                 println!("\nInterrupted: {reason}");
             }
+            RunOutcome::Failed { node, error, .. } => {
+                println!("\nFailed at {node}: {error}");
+            }
         }
     } else {
         // ---------------------------------------------------------------
@@ -322,6 +325,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
             RunOutcome::Interrupted { reason, .. } => {
                 println!("\nInterrupted: {reason}");
+            }
+            RunOutcome::Failed { node, error, .. } => {
+                println!("\nFailed at {node}: {error}");
             }
         }
     }

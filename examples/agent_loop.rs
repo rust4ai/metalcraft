@@ -124,6 +124,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             println!("Reason: {reason}");
             println!("Would resume at: {resume_from}");
         }
+        RunOutcome::Failed { node, error, .. } => {
+            println!("\n=== Agent failed at {node}: {error} ===");
+        }
     }
 
     Ok(())
