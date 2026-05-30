@@ -16,6 +16,30 @@ use crate::tools::{
     BeforeToolCallHook, PendingToolCall, ToolCallState, ToolNode, ToolRegistry, ToolResult,
 };
 
+/// Render an error together with its full `source()` chain.
+///
+/// Many lower-level errors carry the useful detail in their source, not their
+/// top-level `Display`. The classic offender is `reqwest::Error` for a failed
+/// decode: `to_string()` yields only `"error decoding response body"`, while
+/// the source chain holds the actual cause (e.g. the serde line/column, or the
+/// provider's raw error payload). Flattening with `to_string()` throws that
+/// away; this walks the chain so callers see *why* a request failed.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let s = cause.to_string();
+        // Skip causes whose text the parent already embeds, to avoid
+        // "decode error: decode error: ..." style duplication.
+        if !out.contains(&s) {
+            out.push_str(": ");
+            out.push_str(&s);
+        }
+        source = cause.source();
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // LlmCallHook — observe the raw context sent to the LLM each turn
 // ---------------------------------------------------------------------------
@@ -403,7 +427,7 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
             .await
             .map_err(|e| GraphError::Node {
                 node: "agent".into(),
-                message: e.to_string(),
+                message: error_chain(&e),
             })?;
 
         // Parse response: extract tool calls and text from AssistantContent
