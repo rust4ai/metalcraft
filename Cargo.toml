@@ -1,6 +1,6 @@
 [package]
 name = "metalcraft"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "A LangGraph-style stateful graph orchestrator for AI agents in Rust"
 license = "MIT"
@@ -19,7 +19,7 @@ thiserror    = "2"
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"
 tracing      = "0.1"
-rig           = { version = "0.36", optional = true }
+rig           = { version = "0.37", optional = true }
 
 [features]
 default = []
@@ -27,7 +27,7 @@ rig = ["dep:rig"]
 
 [dev-dependencies]
 spice-framework = "0.1"
-rig              = "0.36"
+rig              = "0.37"
 
 [[example]]
 name = "agent_loop"

@@ -159,10 +159,10 @@ impl<M: CompletionModel + 'static> Node<ManualAgentState> for LlmNode<M> {
                 .unwrap_or_default()
         };
 
-        let history = vec![RigMessage::system(&tool_instructions)];
+        let mut history = vec![RigMessage::system(&tool_instructions)];
         let response = self
             .agent
-            .chat(&prompt, history)
+            .chat(&prompt, &mut history)
             .await
             .map_err(|e| GraphError::Node {
                 node: "llm".into(),

@@ -60,6 +60,40 @@ pub struct LlmCallSnapshot {
 /// Hook called with the raw LLM request context before each `.send()`.
 pub type LlmCallHook = Arc<dyn Fn(&LlmCallSnapshot) + Send + Sync>;
 
+/// Token usage reported by the provider for a single LLM call.
+///
+/// A provider-neutral projection of `rig`'s usage so consumers don't depend on
+/// rig types. Counts a provider doesn't report come back as `0`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct LlmUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    /// Input tokens served from a provider-managed prompt cache.
+    pub cached_input_tokens: u64,
+    /// Tokens spent on internal reasoning by reasoning-capable models.
+    pub reasoning_tokens: u64,
+}
+
+/// Snapshot of an LLM call's *result*, delivered after `.send()` returns.
+///
+/// Complements [`LlmCallSnapshot`] (which is the pre-call request). This is the
+/// only place per-call token usage is available, since the request hook fires
+/// before the provider responds.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LlmResponseSnapshot {
+    /// Assistant text produced. Empty when the model only requested tool calls.
+    pub output_text: String,
+    /// Names of the tools the model requested in this response, in order.
+    pub tool_calls: Vec<String>,
+    /// Token usage reported by the provider.
+    pub usage: LlmUsage,
+}
+
+/// Hook called with the LLM response (output + token usage) after each
+/// `.send()`. Pairs with [`LlmCallHook`] to bracket one model call.
+pub type LlmResponseHook = Arc<dyn Fn(&LlmResponseSnapshot) + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // AgentTurn — structured turn data extracted from message history
 // ---------------------------------------------------------------------------
@@ -357,6 +391,7 @@ pub struct ReactAgentNode<M: CompletionModel> {
     system_prompt: String,
     registry: Arc<ToolRegistry>,
     llm_call_hook: Option<LlmCallHook>,
+    llm_response_hook: Option<LlmResponseHook>,
 }
 
 impl<M: CompletionModel> ReactAgentNode<M> {
@@ -366,12 +401,20 @@ impl<M: CompletionModel> ReactAgentNode<M> {
             system_prompt,
             registry,
             llm_call_hook: None,
+            llm_response_hook: None,
         }
     }
 
     /// Attach a hook that observes the raw context sent to the LLM each turn.
     pub fn with_llm_call_hook(mut self, hook: LlmCallHook) -> Self {
         self.llm_call_hook = Some(hook);
+        self
+    }
+
+    /// Attach a hook that observes the LLM response (output + token usage)
+    /// after each `.send()` returns.
+    pub fn with_llm_response_hook(mut self, hook: LlmResponseHook) -> Self {
+        self.llm_response_hook = Some(hook);
         self
     }
 }
@@ -430,6 +473,10 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
                 message: error_chain(&e),
             })?;
 
+        // Capture token usage before consuming `response.choice` below (both are
+        // independent fields, so this is just a partial move).
+        let usage = response.usage;
+
         // Parse response: extract tool calls and text from AssistantContent
         let mut tool_calls = Vec::new();
         let mut text_parts = Vec::new();
@@ -449,6 +496,23 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
                 }
                 _ => {} // Reasoning, Image — ignore
             }
+        }
+
+        // Fire the response hook with output + token usage. This is the only
+        // place per-call usage is observable (the request hook fires pre-send).
+        if let Some(ref hook) = self.llm_response_hook {
+            let snapshot = LlmResponseSnapshot {
+                output_text: text_parts.join("\n"),
+                tool_calls: tool_calls.iter().map(|t| t.name.clone()).collect(),
+                usage: LlmUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    total_tokens: usage.total_tokens,
+                    cached_input_tokens: usage.cached_input_tokens,
+                    reasoning_tokens: usage.reasoning_tokens,
+                },
+            };
+            hook(&snapshot);
         }
 
         if tool_calls.is_empty() {
@@ -572,27 +636,33 @@ pub fn create_react_agent<M: CompletionModel + 'static>(
     tools: ToolRegistry,
     system_prompt: impl Into<String>,
 ) -> Result<CompiledGraph<AgentState>> {
-    create_react_agent_with_hooks(model, tools, system_prompt, None, None)
+    create_react_agent_with_hooks(model, tools, system_prompt, None, None, None)
 }
 
 /// Build a ReAct agent graph with optional hooks.
 ///
 /// - `before_tool_call`: runs before each tool execution; can approve or deny calls.
 /// - `llm_call_hook`: observes the raw context sent to the LLM each turn.
+/// - `llm_response_hook`: observes the LLM response (output + token usage) after
+///   each call returns.
 ///
-/// See [`BeforeToolCallHook`] and [`LlmCallHook`] for details.
+/// See [`BeforeToolCallHook`], [`LlmCallHook`] and [`LlmResponseHook`] for details.
 pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
     model: M,
     tools: ToolRegistry,
     system_prompt: impl Into<String>,
     before_tool_call: Option<BeforeToolCallHook>,
     llm_call_hook: Option<LlmCallHook>,
+    llm_response_hook: Option<LlmResponseHook>,
 ) -> Result<CompiledGraph<AgentState>> {
     let registry = Arc::new(tools);
 
     let mut agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone());
     if let Some(hook) = llm_call_hook {
         agent_node = agent_node.with_llm_call_hook(hook);
+    }
+    if let Some(hook) = llm_response_hook {
+        agent_node = agent_node.with_llm_response_hook(hook);
     }
     let mut tool_node = ToolNode::new(registry);
     if let Some(hook) = before_tool_call {

@@ -30,6 +30,7 @@ pub use prebuilt::{
     AgentMessage, AgentState, AgentUpdate, AgentTurn, AgentToolCall, AgentToolResult,
     ReactAgentNode, create_react_agent, create_react_agent_with_hooks,
     LlmCallSnapshot, LlmCallHook,
+    LlmResponseSnapshot, LlmResponseHook, LlmUsage,
 };
 
 /// Re-export Rig when the `rig` feature is enabled.
