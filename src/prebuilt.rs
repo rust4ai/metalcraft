@@ -392,6 +392,7 @@ pub struct ReactAgentNode<M: CompletionModel> {
     registry: Arc<ToolRegistry>,
     llm_call_hook: Option<LlmCallHook>,
     llm_response_hook: Option<LlmResponseHook>,
+    tool_choice: ToolChoice,
 }
 
 impl<M: CompletionModel> ReactAgentNode<M> {
@@ -402,6 +403,7 @@ impl<M: CompletionModel> ReactAgentNode<M> {
             registry,
             llm_call_hook: None,
             llm_response_hook: None,
+            tool_choice: ToolChoice::Auto,
         }
     }
 
@@ -415,6 +417,14 @@ impl<M: CompletionModel> ReactAgentNode<M> {
     /// after each `.send()` returns.
     pub fn with_llm_response_hook(mut self, hook: LlmResponseHook) -> Self {
         self.llm_response_hook = Some(hook);
+        self
+    }
+
+    /// Set the tool-choice policy. [`ToolChoice::Required`] forces the model to
+    /// emit at least one tool call every step (never free text); pair it with a
+    /// terminal tool (see [`AgentOptions::terminal_tools`]) so the loop can end.
+    pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
+        self.tool_choice = tool_choice;
         self
     }
 }
@@ -460,18 +470,22 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
             hook(&snapshot);
         }
 
-        let response = self
+        let mut builder = self
             .model
             .completion_request(prompt)
             .preamble(self.system_prompt.clone())
             .messages(history)
-            .tools(tool_defs)
-            .send()
-            .await
-            .map_err(|e| GraphError::Node {
-                node: "agent".into(),
-                message: error_chain(&e),
-            })?;
+            .tools(tool_defs);
+        // Force tool-only output when configured. With `Required` the model
+        // never returns free text, so the turn must be ended by a terminal tool
+        // (wired in the graph by `create_react_agent_with_options`).
+        if matches!(self.tool_choice, ToolChoice::Required) {
+            builder = builder.tool_choice(rig::completion::message::ToolChoice::Required);
+        }
+        let response = builder.send().await.map_err(|e| GraphError::Node {
+            node: "agent".into(),
+            message: error_chain(&e),
+        })?;
 
         // Capture token usage before consuming `response.choice` below (both are
         // independent fields, so this is just a partial move).
@@ -639,6 +653,41 @@ pub fn create_react_agent<M: CompletionModel + 'static>(
     create_react_agent_with_hooks(model, tools, system_prompt, None, None, None)
 }
 
+/// Tool-choice policy for the ReAct agent node.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// The model decides whether to call tools or answer with free text. When it
+    /// answers with text, the turn ends. This is the historical default.
+    #[default]
+    Auto,
+    /// The model must emit at least one tool call on every step and may never
+    /// answer with free text. Because the loop's natural exit (a free-text final
+    /// answer) can no longer occur, a terminal tool MUST be configured (see
+    /// [`AgentOptions::terminal_tools`]) so a turn can complete.
+    Required,
+}
+
+/// Options for [`create_react_agent_with_options`]. All fields default to the
+/// historical behavior, so `AgentOptions::default()` reproduces
+/// [`create_react_agent`].
+#[derive(Default)]
+pub struct AgentOptions {
+    /// Runs before each tool execution; can approve or deny calls.
+    pub before_tool_call: Option<BeforeToolCallHook>,
+    /// Observes the raw context sent to the LLM each turn.
+    pub llm_call_hook: Option<LlmCallHook>,
+    /// Observes the LLM response (output + token usage) after each call returns.
+    pub llm_response_hook: Option<LlmResponseHook>,
+    /// Whether the model may answer with free text or must call a tool.
+    pub tool_choice: ToolChoice,
+    /// Names of tools that, when called, end the turn after they execute (the
+    /// graph routes to `END` instead of looping back to the agent). Empty means
+    /// the turn only ends on a free-text answer (historical behavior). This is
+    /// what makes [`ToolChoice::Required`] usable: e.g. a `say_to_user` tool that
+    /// both delivers the reply and terminates the turn.
+    pub terminal_tools: Vec<String>,
+}
+
 /// Build a ReAct agent graph with optional hooks.
 ///
 /// - `before_tool_call`: runs before each tool execution; can approve or deny calls.
@@ -655,9 +704,46 @@ pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
     llm_call_hook: Option<LlmCallHook>,
     llm_response_hook: Option<LlmResponseHook>,
 ) -> Result<CompiledGraph<AgentState>> {
+    create_react_agent_with_options(
+        model,
+        tools,
+        system_prompt,
+        AgentOptions {
+            before_tool_call,
+            llm_call_hook,
+            llm_response_hook,
+            ..Default::default()
+        },
+    )
+}
+
+/// Build a ReAct agent graph with full options, including tool-choice forcing
+/// and terminal tools.
+///
+/// When `options.tool_choice` is [`ToolChoice::Required`] the model is forced to
+/// emit tool calls and never free text. In that mode you should also set
+/// `options.terminal_tools` to the tool(s) that end a turn — otherwise the loop
+/// only stops at `max_steps`. When `terminal_tools` is empty the graph behaves
+/// exactly as [`create_react_agent_with_hooks`]: `tools` always loops back to
+/// `agent`, and a turn ends on a free-text final answer.
+pub fn create_react_agent_with_options<M: CompletionModel + 'static>(
+    model: M,
+    tools: ToolRegistry,
+    system_prompt: impl Into<String>,
+    options: AgentOptions,
+) -> Result<CompiledGraph<AgentState>> {
+    let AgentOptions {
+        before_tool_call,
+        llm_call_hook,
+        llm_response_hook,
+        tool_choice,
+        terminal_tools,
+    } = options;
+
     let registry = Arc::new(tools);
 
-    let mut agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone());
+    let mut agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone())
+        .with_tool_choice(tool_choice);
     if let Some(hook) = llm_call_hook {
         agent_node = agent_node.with_llm_call_hook(hook);
     }
@@ -669,7 +755,7 @@ pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
         tool_node = tool_node.with_before_hook(hook);
     }
 
-    Graph::<AgentState>::new()
+    let graph = Graph::<AgentState>::new()
         .add_node("agent", agent_node)
         .add_node("tools", tool_node)
         .add_conditional("agent", |state: &AgentState| {
@@ -680,8 +766,86 @@ pub fn create_react_agent_with_hooks<M: CompletionModel + 'static>(
             } else {
                 END.to_string()
             }
+        });
+
+    let graph = if terminal_tools.is_empty() {
+        // Historical behavior: after tools run, always return to the agent.
+        graph.add_edge("tools", "agent")
+    } else {
+        // After tools run, end the turn if the just-executed batch invoked a
+        // terminal tool; otherwise loop back to the agent. The freshly-appended
+        // ToolResult messages sit at the tail of `messages`.
+        graph.add_conditional("tools", move |state: &AgentState| {
+            if invoked_terminal_tool(state, &terminal_tools) {
+                END.to_string()
+            } else {
+                "agent".to_string()
+            }
         })
-        .add_edge("tools", "agent")
-        .set_entry("agent")
-        .compile()
+    };
+
+    graph.set_entry("agent").compile()
+}
+
+/// True if the most recently executed tool batch (the trailing run of
+/// `ToolResult` messages on `state`) invoked any tool named in `terminal_tools`.
+/// Used by [`create_react_agent_with_options`] to decide whether a turn ends
+/// after the `tools` node runs.
+fn invoked_terminal_tool(state: &AgentState, terminal_tools: &[String]) -> bool {
+    state
+        .messages
+        .iter()
+        .rev()
+        .take_while(|m| matches!(m, AgentMessage::ToolResult { .. }))
+        .any(|m| match m {
+            AgentMessage::ToolResult { name, .. } => terminal_tools.iter().any(|t| t == name),
+            _ => false,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tool_result(name: &str) -> AgentMessage {
+        AgentMessage::ToolResult {
+            id: format!("call_{name}"),
+            call_id: None,
+            name: name.to_string(),
+            result: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn detects_terminal_tool_in_trailing_results() {
+        let terminal = vec!["say_to_user".to_string()];
+        let mut state = AgentState::new("hi");
+        // A non-terminal tool just ran: keep looping.
+        state.messages.push(tool_result("web_fetch"));
+        assert!(!invoked_terminal_tool(&state, &terminal));
+        // A batch that includes the terminal tool: end the turn.
+        state.messages.push(tool_result("say_to_user"));
+        assert!(invoked_terminal_tool(&state, &terminal));
+    }
+
+    #[test]
+    fn terminal_only_counts_the_trailing_tool_batch() {
+        let terminal = vec!["say_to_user".to_string()];
+        let mut state = AgentState::new("hi");
+        // say_to_user ran in an *earlier* batch...
+        state.messages.push(tool_result("say_to_user"));
+        // ...but the latest assistant turn called another tool, whose result is
+        // the new tail. `take_while` stops at the Assistant message, so the old
+        // say_to_user is not counted and the loop continues.
+        state.messages.push(AgentMessage::Assistant(String::new()));
+        state.messages.push(tool_result("grep"));
+        assert!(!invoked_terminal_tool(&state, &terminal));
+    }
+
+    #[test]
+    fn empty_terminal_list_never_terminates() {
+        let mut state = AgentState::new("hi");
+        state.messages.push(tool_result("say_to_user"));
+        assert!(!invoked_terminal_tool(&state, &[]));
+    }
 }

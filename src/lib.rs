@@ -29,6 +29,7 @@ pub use tools::{
 pub use prebuilt::{
     AgentMessage, AgentState, AgentUpdate, AgentTurn, AgentToolCall, AgentToolResult,
     ReactAgentNode, create_react_agent, create_react_agent_with_hooks,
+    create_react_agent_with_options, AgentOptions, ToolChoice,
     LlmCallSnapshot, LlmCallHook,
     LlmResponseSnapshot, LlmResponseHook, LlmUsage,
 };
