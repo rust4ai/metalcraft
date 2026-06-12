@@ -451,7 +451,7 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
             .collect();
 
         // Build conversation history
-        let (prompt, history) = self.build_conversation(state);
+        let (prompt, history) = build_conversation(state);
 
         // Fire the LLM call hook with the full raw context
         if let Some(ref hook) = self.llm_call_hook {
@@ -538,60 +538,33 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
     }
 }
 
-impl<M: CompletionModel> ReactAgentNode<M> {
-    /// Build the conversation history from agent state.
-    ///
-    /// Returns (prompt_message, chat_history).
-    fn build_conversation(&self, state: &AgentState) -> (RigMessage, Vec<RigMessage>) {
-        let mut history: Vec<RigMessage> = Vec::new();
+/// Build the conversation history from agent state.
+///
+/// Returns (prompt_message, chat_history).
+///
+/// Assistant turns are replayed with an (empty) id via [`RigMessage::assistant_with_id`]
+/// rather than [`RigMessage::assistant`]. rig-core 0.38.2's OpenAI Responses API
+/// serializer emits `input_text` for assistant messages whose `id` is `None` while
+/// still tagging them `role: assistant` — a combination OpenAI rejects with HTTP 400
+/// ("Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'").
+/// Supplying an id forces the valid `output_text` form; the empty id is dropped on the
+/// wire (`skip_serializing_if = "String::is_empty"`).
+fn build_conversation(state: &AgentState) -> (RigMessage, Vec<RigMessage>) {
+    let mut history: Vec<RigMessage> = Vec::new();
 
-        if state.messages.is_empty() {
-            return (RigMessage::user(""), history);
-        }
+    if state.messages.is_empty() {
+        return (RigMessage::user(""), history);
+    }
 
-        let (earlier, last) = state.messages.split_at(state.messages.len() - 1);
+    let (earlier, last) = state.messages.split_at(state.messages.len() - 1);
 
-        for msg in earlier {
-            match msg {
-                AgentMessage::User(text) => {
-                    history.push(RigMessage::user(text));
-                }
-                AgentMessage::Assistant(text) => {
-                    history.push(RigMessage::assistant(text));
-                }
-                AgentMessage::ToolCall {
-                    id, call_id, name, args,
-                } => {
-                    let mut tc = rig::completion::message::ToolCall::new(
-                        id.clone(),
-                        rig::completion::message::ToolFunction {
-                            name: name.clone(),
-                            arguments: args.clone(),
-                        },
-                    );
-                    if let Some(cid) = call_id {
-                        tc = tc.with_call_id(cid.clone());
-                    }
-                    history.push(RigMessage::from(tc));
-                }
-                AgentMessage::ToolResult {
-                    id, call_id, result, ..
-                } => {
-                    let cid = call_id.clone().or_else(|| Some(id.clone()));
-                    history.push(RigMessage::tool_result_with_call_id(id, cid, result));
-                }
+    for msg in earlier {
+        match msg {
+            AgentMessage::User(text) => {
+                history.push(RigMessage::user(text));
             }
-        }
-
-        // The last message becomes the prompt
-        let prompt = match &last[0] {
-            AgentMessage::User(text) => RigMessage::user(text),
-            AgentMessage::Assistant(text) => RigMessage::user(text),
-            AgentMessage::ToolResult {
-                id, call_id, result, ..
-            } => {
-                let cid = call_id.clone().or_else(|| Some(id.clone()));
-                RigMessage::tool_result_with_call_id(id, cid, result)
+            AgentMessage::Assistant(text) => {
+                history.push(RigMessage::assistant_with_id(String::new(), text));
             }
             AgentMessage::ToolCall {
                 id, call_id, name, args,
@@ -606,12 +579,45 @@ impl<M: CompletionModel> ReactAgentNode<M> {
                 if let Some(cid) = call_id {
                     tc = tc.with_call_id(cid.clone());
                 }
-                RigMessage::from(tc)
+                history.push(RigMessage::from(tc));
             }
-        };
-
-        (prompt, history)
+            AgentMessage::ToolResult {
+                id, call_id, result, ..
+            } => {
+                let cid = call_id.clone().or_else(|| Some(id.clone()));
+                history.push(RigMessage::tool_result_with_call_id(id, cid, result));
+            }
+        }
     }
+
+    // The last message becomes the prompt
+    let prompt = match &last[0] {
+        AgentMessage::User(text) => RigMessage::user(text),
+        AgentMessage::Assistant(text) => RigMessage::user(text),
+        AgentMessage::ToolResult {
+            id, call_id, result, ..
+        } => {
+            let cid = call_id.clone().or_else(|| Some(id.clone()));
+            RigMessage::tool_result_with_call_id(id, cid, result)
+        }
+        AgentMessage::ToolCall {
+            id, call_id, name, args,
+        } => {
+            let mut tc = rig::completion::message::ToolCall::new(
+                id.clone(),
+                rig::completion::message::ToolFunction {
+                    name: name.clone(),
+                    arguments: args.clone(),
+                },
+            );
+            if let Some(cid) = call_id {
+                tc = tc.with_call_id(cid.clone());
+            }
+            RigMessage::from(tc)
+        }
+    };
+
+    (prompt, history)
 }
 
 // ---------------------------------------------------------------------------
@@ -847,5 +853,72 @@ mod tests {
         let mut state = AgentState::new("hi");
         state.messages.push(tool_result("say_to_user"));
         assert!(!invoked_terminal_tool(&state, &[]));
+    }
+
+    /// Regression for the multi-turn HTTP 400 from the OpenAI Responses API:
+    ///
+    ///   "Invalid value: 'input_text'. Supported values are: 'output_text' and
+    ///    'refusal'." (param: input[N].content[0])
+    ///
+    /// A prior assistant turn replayed as conversation history must serialize as
+    /// `output_text`. rig-core 0.38.2 emits `input_text` for assistant messages
+    /// with `id: None` while keeping `role: assistant`, which OpenAI rejects.
+    /// `build_conversation` must produce assistant items that avoid this.
+    #[test]
+    fn assistant_history_serializes_as_output_text() {
+        use rig::providers::openai::responses_api::InputItem;
+
+        // Mirror a real multi-turn chat: [user, assistant, user(question)].
+        let mut state = AgentState::new("what is teller?");
+        state
+            .messages
+            .push(AgentMessage::Assistant("Teller is a lending protocol.".into()));
+        state
+            .messages
+            .push(AgentMessage::User("how do teller loans work".into()));
+
+        let (prompt, history) = build_conversation(&state);
+
+        // Assemble the request `input` array the way rig's Responses API does:
+        // chat_history followed by the prompt.
+        let mut messages = history;
+        messages.push(prompt);
+
+        let mut input_items: Vec<InputItem> = Vec::new();
+        for m in messages {
+            let items: Vec<InputItem> = m.try_into().expect("message converts to input items");
+            input_items.extend(items);
+        }
+
+        let json = serde_json::to_value(&input_items).expect("serialize input items");
+        let arr = json.as_array().expect("input serializes to an array");
+
+        // Every assistant-role text item must use `output_text`, never `input_text`.
+        let mut saw_assistant_text = false;
+        for item in arr {
+            if item.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                continue;
+            }
+            let Some(content) = item.get("content").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for part in content {
+                if let Some(ty @ ("input_text" | "output_text")) =
+                    part.get("type").and_then(|t| t.as_str())
+                {
+                    saw_assistant_text = true;
+                    assert_eq!(
+                        ty, "output_text",
+                        "assistant history must serialize as output_text, not input_text \
+                         (OpenAI Responses API rejects input_text on assistant role); \
+                         offending item: {item}"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_assistant_text,
+            "expected an assistant text item in the serialized input; got: {json}"
+        );
     }
 }
