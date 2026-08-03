@@ -538,6 +538,69 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
     }
 }
 
+/// Ensure every `ToolCall` in the history is followed by a matching
+/// `ToolResult`. Any call whose result was dropped (an unknown tool the
+/// ToolNode skipped, a guard interruption, a provider hiccup) gets a synthetic
+/// error result inserted at the end of its contiguous tool block — i.e. right
+/// before the next user/assistant turn, or the end of the history. Without this
+/// an orphaned assistant `tool_calls` makes OpenAI reject the whole request with
+/// a 400. Mirrors the between-turn patch in [`AgentState::continue_with`], but
+/// runs before *every* model call, not only when a new user message arrives.
+fn backfill_orphaned_tool_results(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+    use std::collections::HashSet;
+
+    let resolved: HashSet<&str> = messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::ToolResult { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // Common case: nothing orphaned — skip the rebuild entirely.
+    let has_orphan = messages.iter().any(|m| match m {
+        AgentMessage::ToolCall { id, .. } => !resolved.contains(id.as_str()),
+        _ => false,
+    });
+    if !has_orphan {
+        return messages.to_vec();
+    }
+
+    fn flush(out: &mut Vec<AgentMessage>, pending: &mut Vec<(String, Option<String>, String)>) {
+        for (id, call_id, name) in pending.drain(..) {
+            out.push(AgentMessage::ToolResult {
+                id,
+                call_id,
+                name,
+                result: "ERROR: tool call produced no result (backfilled to keep the \
+                         tool-call/result sequence valid)"
+                    .to_string(),
+            });
+        }
+    }
+
+    let mut out: Vec<AgentMessage> = Vec::with_capacity(messages.len() + 1);
+    let mut pending: Vec<(String, Option<String>, String)> = Vec::new();
+    for msg in messages {
+        match msg {
+            AgentMessage::ToolCall { id, call_id, name, .. } => {
+                out.push(msg.clone());
+                if !resolved.contains(id.as_str()) {
+                    pending.push((id.clone(), call_id.clone(), name.clone()));
+                }
+            }
+            AgentMessage::ToolResult { .. } => out.push(msg.clone()),
+            // Turn boundary: any orphan must be answered before the next turn.
+            AgentMessage::User(_) | AgentMessage::Assistant(_) => {
+                flush(&mut out, &mut pending);
+                out.push(msg.clone());
+            }
+        }
+    }
+    flush(&mut out, &mut pending);
+    out
+}
+
 /// Build the conversation history from agent state.
 ///
 /// Returns (prompt_message, chat_history).
@@ -556,7 +619,14 @@ fn build_conversation(state: &AgentState) -> (RigMessage, Vec<RigMessage>) {
         return (RigMessage::user(""), history);
     }
 
-    let (earlier, last) = state.messages.split_at(state.messages.len() - 1);
+    // Guarantee every assistant tool_call is answered by a tool result before
+    // the history reaches the provider. A dropped/missing result (an unknown
+    // tool the ToolNode skipped, a guard interruption, a provider hiccup) would
+    // otherwise leave an orphaned tool_call that OpenAI rejects with a 400
+    // ("tool_call_ids did not have response messages"). This is the single choke
+    // point every model call passes through, so patching here covers them all.
+    let messages = backfill_orphaned_tool_results(&state.messages);
+    let (earlier, last) = messages.split_at(messages.len() - 1);
 
     for msg in earlier {
         match msg {
@@ -820,6 +890,84 @@ mod tests {
             name: name.to_string(),
             result: "{}".to_string(),
         }
+    }
+
+    fn tool_call(name: &str) -> AgentMessage {
+        AgentMessage::ToolCall {
+            id: format!("call_{name}"),
+            call_id: None,
+            name: name.to_string(),
+            args: serde_json::json!({}),
+        }
+    }
+
+    fn ids_missing_results(msgs: &[AgentMessage]) -> Vec<String> {
+        let resolved: std::collections::HashSet<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::ToolResult { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        msgs.iter()
+            .filter_map(|m| match m {
+                AgentMessage::ToolCall { id, .. } if !resolved.contains(id.as_str()) => {
+                    Some(id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn backfill_leaves_fully_paired_history_untouched() {
+        let msgs = vec![
+            AgentMessage::User("hi".into()),
+            tool_call("grep"),
+            tool_result("grep"),
+        ];
+        let out = backfill_orphaned_tool_results(&msgs);
+        assert_eq!(out.len(), msgs.len());
+        assert!(ids_missing_results(&out).is_empty());
+    }
+
+    #[test]
+    fn backfill_answers_orphan_within_a_parallel_batch() {
+        // Two calls in one assistant turn, but only one came back — the classic
+        // dropped-result case that OpenAI rejects with a 400.
+        let msgs = vec![
+            AgentMessage::User("hi".into()),
+            tool_call("grep"),
+            tool_call("read_file"),
+            tool_result("grep"),
+            AgentMessage::Assistant("done".into()),
+        ];
+        assert_eq!(ids_missing_results(&msgs), vec!["call_read_file".to_string()]);
+
+        let out = backfill_orphaned_tool_results(&msgs);
+        // Orphan is now answered, and the synthetic result sits before the next
+        // assistant turn so the tool-call/result block stays contiguous.
+        assert!(ids_missing_results(&out).is_empty());
+        let assistant_pos = out
+            .iter()
+            .position(|m| matches!(m, AgentMessage::Assistant(_)))
+            .unwrap();
+        let backfilled_pos = out
+            .iter()
+            .position(|m| matches!(m, AgentMessage::ToolResult { id, .. } if id == "call_read_file"))
+            .unwrap();
+        assert!(backfilled_pos < assistant_pos);
+    }
+
+    #[test]
+    fn backfill_answers_trailing_orphan() {
+        let msgs = vec![
+            AgentMessage::User("hi".into()),
+            tool_call("grep"),
+        ];
+        let out = backfill_orphaned_tool_results(&msgs);
+        assert!(ids_missing_results(&out).is_empty());
+        assert!(matches!(out.last().unwrap(), AgentMessage::ToolResult { id, .. } if id == "call_grep"));
     }
 
     #[test]
