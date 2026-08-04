@@ -7,6 +7,8 @@
 //! [`ToolRegistry`].
 
 use async_trait::async_trait;
+use rig::OneOrMany;
+use rig::completion::message::{Reasoning, ReasoningContent};
 use rig::completion::{AssistantContent, CompletionModel, Message as RigMessage, ToolDefinition};
 use std::sync::Arc;
 
@@ -130,11 +132,42 @@ pub struct AgentTurn {
 // AgentMessage — typed conversation history
 // ---------------------------------------------------------------------------
 
+/// A reasoning item emitted by a reasoning-capable model (e.g. OpenAI's
+/// `gpt-5.x` family on the Responses API), preserved so it can be replayed on a
+/// later turn.
+///
+/// The Responses API pairs every `function_call` item with the `reasoning` item
+/// (`rs_…`) that produced it, and **rejects** a turn that replays the
+/// `function_call` without its reasoning item ("Item 'fc_…' of type
+/// 'function_call' was provided without its required 'reasoning' item"). So once
+/// a model reasons before calling a tool, we must carry the reasoning item
+/// through history and send it back alongside the tool call. See
+/// [`AgentMessage::Reasoning`] and [`build_conversation`].
+#[derive(Debug, Clone)]
+pub struct ReasoningItem {
+    /// Provider-assigned id (OpenAI `rs_…`). Links the item to its tool call.
+    pub id: String,
+    /// The `reasoning.encrypted_content` payload. This is what the Responses API
+    /// validates a replayed reasoning item against, so we only keep items that
+    /// carry it — an id alone cannot be replayed. The provider returns it only
+    /// when a `reasoning` request parameter is set (see
+    /// [`ReactAgentNode::with_reasoning_effort`]).
+    pub encrypted: String,
+}
+
 /// A message in the agent's conversation history.
 #[derive(Debug, Clone)]
 pub enum AgentMessage {
     User(String),
     Assistant(String),
+    /// A reasoning item from a reasoning-capable model, kept so it can be
+    /// replayed before the tool call(s) it produced. Only stored when a turn
+    /// emits tool calls (a final text answer ends the turn, so its reasoning
+    /// never needs replaying). See [`ReasoningItem`].
+    Reasoning {
+        id: String,
+        encrypted: String,
+    },
     ToolCall {
         id: String,
         call_id: Option<String>,
@@ -273,6 +306,9 @@ impl AgentState {
                         assistant_text: Some(text.clone()),
                     });
                 }
+                // Reasoning items are an internal replay artifact, not a
+                // user-facing turn — skip them in the structured view.
+                AgentMessage::Reasoning { .. } => {}
             }
         }
 
@@ -318,8 +354,13 @@ impl AgentState {
 
 /// Update variants for [`AgentState`].
 pub enum AgentUpdate {
-    /// The LLM wants to call tools.
-    ToolCalls(Vec<PendingToolCall>),
+    /// The LLM wants to call tools, optionally preceded by the reasoning
+    /// item(s) that produced them (kept so they can be replayed — see
+    /// [`ReasoningItem`]).
+    ToolCalls {
+        reasoning: Vec<ReasoningItem>,
+        calls: Vec<PendingToolCall>,
+    },
     /// The LLM produced a final answer (no tool calls).
     FinalAnswer(String),
     /// Tool execution results.
@@ -331,7 +372,15 @@ impl Reducer for AgentState {
 
     fn apply(&mut self, update: AgentUpdate) {
         match update {
-            AgentUpdate::ToolCalls(calls) => {
+            AgentUpdate::ToolCalls { reasoning, calls } => {
+                // Reasoning items must precede the tool call(s) they produced so
+                // the Responses API accepts the replayed `function_call`.
+                for item in reasoning {
+                    self.messages.push(AgentMessage::Reasoning {
+                        id: item.id,
+                        encrypted: item.encrypted,
+                    });
+                }
                 for call in &calls {
                     self.messages.push(AgentMessage::ToolCall {
                         id: call.id.clone(),
@@ -393,6 +442,7 @@ pub struct ReactAgentNode<M: CompletionModel> {
     llm_call_hook: Option<LlmCallHook>,
     llm_response_hook: Option<LlmResponseHook>,
     tool_choice: ToolChoice,
+    reasoning_effort: Option<String>,
 }
 
 impl<M: CompletionModel> ReactAgentNode<M> {
@@ -404,6 +454,7 @@ impl<M: CompletionModel> ReactAgentNode<M> {
             llm_call_hook: None,
             llm_response_hook: None,
             tool_choice: ToolChoice::Auto,
+            reasoning_effort: None,
         }
     }
 
@@ -425,6 +476,19 @@ impl<M: CompletionModel> ReactAgentNode<M> {
     /// terminal tool (see [`AgentOptions::terminal_tools`]) so the loop can end.
     pub fn with_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = tool_choice;
+        self
+    }
+
+    /// Set the reasoning effort (`none` | `minimal` | `low` | `medium` | `high`
+    /// | `xhigh` | `max`) for reasoning-capable models on OpenAI's Responses
+    /// API. When set, the request carries a `reasoning` parameter, which also
+    /// makes the provider return the `reasoning.encrypted_content` needed to
+    /// replay reasoning items across turns (see [`ReasoningItem`]).
+    ///
+    /// Leave unset (the default) for non-reasoning models — passing a
+    /// `reasoning` parameter to a model that doesn't support it is an error.
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort.filter(|s| !s.trim().is_empty());
         self
     }
 }
@@ -482,6 +546,15 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
         if matches!(self.tool_choice, ToolChoice::Required) {
             builder = builder.tool_choice(rig::completion::message::ToolChoice::Required);
         }
+        // Enable reasoning for reasoning-capable models. Setting the `reasoning`
+        // parameter also makes rig request `reasoning.encrypted_content`, which
+        // is what lets reasoning items round-trip across turns so a replayed
+        // tool call keeps its paired reasoning item (see [`ReasoningItem`]).
+        if let Some(effort) = &self.reasoning_effort {
+            builder = builder.additional_params(serde_json::json!({
+                "reasoning": { "effort": effort }
+            }));
+        }
         let response = builder.send().await.map_err(|e| GraphError::Node {
             node: "agent".into(),
             message: error_chain(&e),
@@ -491,9 +564,11 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
         // independent fields, so this is just a partial move).
         let usage = response.usage;
 
-        // Parse response: extract tool calls and text from AssistantContent
+        // Parse response: extract tool calls, text, and reasoning items from
+        // AssistantContent.
         let mut tool_calls = Vec::new();
         let mut text_parts = Vec::new();
+        let mut reasoning_items = Vec::new();
 
         for content in response.choice {
             match content {
@@ -508,7 +583,21 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
                 AssistantContent::Text(t) => {
                     text_parts.push(t.text);
                 }
-                _ => {} // Reasoning, Image — ignore
+                AssistantContent::Reasoning(r) => {
+                    // Keep only reasoning items that carry both an id and the
+                    // encrypted payload — those are the replayable ones the
+                    // Responses API requires alongside their tool call. Items
+                    // without an encrypted payload (e.g. when reasoning wasn't
+                    // requested) can't be replayed, so we don't store them.
+                    let encrypted = r.content.iter().find_map(|c| match c {
+                        ReasoningContent::Encrypted(data) => Some(data.clone()),
+                        _ => None,
+                    });
+                    if let (Some(id), Some(encrypted)) = (r.id, encrypted) {
+                        reasoning_items.push(ReasoningItem { id, encrypted });
+                    }
+                }
+                AssistantContent::Image(_) => {} // not surfaced by this agent
             }
         }
 
@@ -530,10 +619,15 @@ impl<M: CompletionModel + 'static> Node<AgentState> for ReactAgentNode<M> {
         }
 
         if tool_calls.is_empty() {
+            // A final text answer ends the turn; its reasoning never needs to be
+            // replayed, so we drop `reasoning_items` here.
             let final_text = text_parts.join("\n");
             Ok(NodeOutcome::Update(AgentUpdate::FinalAnswer(final_text)))
         } else {
-            Ok(NodeOutcome::Update(AgentUpdate::ToolCalls(tool_calls)))
+            Ok(NodeOutcome::Update(AgentUpdate::ToolCalls {
+                reasoning: reasoning_items,
+                calls: tool_calls,
+            }))
         }
     }
 }
@@ -591,7 +685,11 @@ fn backfill_orphaned_tool_results(messages: &[AgentMessage]) -> Vec<AgentMessage
             }
             AgentMessage::ToolResult { .. } => out.push(msg.clone()),
             // Turn boundary: any orphan must be answered before the next turn.
-            AgentMessage::User(_) | AgentMessage::Assistant(_) => {
+            // A reasoning item leads a fresh assistant turn, so it is a boundary
+            // too (its own turn's tool calls follow it and are resolved normally).
+            AgentMessage::User(_)
+            | AgentMessage::Assistant(_)
+            | AgentMessage::Reasoning { .. } => {
                 flush(&mut out, &mut pending);
                 out.push(msg.clone());
             }
@@ -599,6 +697,19 @@ fn backfill_orphaned_tool_results(messages: &[AgentMessage]) -> Vec<AgentMessage
     }
     flush(&mut out, &mut pending);
     out
+}
+
+/// Build a rig assistant message carrying a single encrypted reasoning item, so
+/// it can be replayed ahead of the tool call it produced. The id links it to the
+/// tool call and the encrypted payload is what the Responses API validates it
+/// against (see [`ReasoningItem`]).
+fn reasoning_message(id: &str, encrypted: &str) -> RigMessage {
+    RigMessage::Assistant {
+        id: None,
+        content: OneOrMany::one(AssistantContent::Reasoning(
+            Reasoning::encrypted(encrypted).with_id(id.to_string()),
+        )),
+    }
 }
 
 /// Build the conversation history from agent state.
@@ -636,6 +747,9 @@ fn build_conversation(state: &AgentState) -> (RigMessage, Vec<RigMessage>) {
             AgentMessage::Assistant(text) => {
                 history.push(RigMessage::assistant_with_id(String::new(), text));
             }
+            AgentMessage::Reasoning { id, encrypted } => {
+                history.push(reasoning_message(id, encrypted));
+            }
             AgentMessage::ToolCall {
                 id, call_id, name, args,
             } => {
@@ -664,6 +778,13 @@ fn build_conversation(state: &AgentState) -> (RigMessage, Vec<RigMessage>) {
     let prompt = match &last[0] {
         AgentMessage::User(text) => RigMessage::user(text),
         AgentMessage::Assistant(text) => RigMessage::user(text),
+        // A reasoning item is always followed by its tool call(s) (and their
+        // results), so it is never the tail of the history in practice. Handle
+        // it defensively: replay it as history and use an empty prompt.
+        AgentMessage::Reasoning { id, encrypted } => {
+            history.push(reasoning_message(id, encrypted));
+            RigMessage::user("")
+        }
         AgentMessage::ToolResult {
             id, call_id, result, ..
         } => {
@@ -762,6 +883,13 @@ pub struct AgentOptions {
     /// what makes [`ToolChoice::Required`] usable: e.g. a `say_to_user` tool that
     /// both delivers the reply and terminates the turn.
     pub terminal_tools: Vec<String>,
+    /// Reasoning effort for reasoning-capable models on OpenAI's Responses API
+    /// (`none` | `minimal` | `low` | `medium` | `high` | `xhigh` | `max`). When
+    /// set, the agent sends a `reasoning` parameter and preserves/replays
+    /// reasoning items across turns — required for tool calling with reasoning
+    /// models like `gpt-5.x`. Leave `None` for non-reasoning models. See
+    /// [`ReactAgentNode::with_reasoning_effort`].
+    pub reasoning_effort: Option<String>,
 }
 
 /// Build a ReAct agent graph with optional hooks.
@@ -814,12 +942,14 @@ pub fn create_react_agent_with_options<M: CompletionModel + 'static>(
         llm_response_hook,
         tool_choice,
         terminal_tools,
+        reasoning_effort,
     } = options;
 
     let registry = Arc::new(tools);
 
     let mut agent_node = ReactAgentNode::new(model, system_prompt.into(), registry.clone())
-        .with_tool_choice(tool_choice);
+        .with_tool_choice(tool_choice)
+        .with_reasoning_effort(reasoning_effort);
     if let Some(hook) = llm_call_hook {
         agent_node = agent_node.with_llm_call_hook(hook);
     }
@@ -1012,6 +1142,54 @@ mod tests {
     /// `output_text`. rig-core 0.38.2 emits `input_text` for assistant messages
     /// with `id: None` while keeping `role: assistant`, which OpenAI rejects.
     /// `build_conversation` must produce assistant items that avoid this.
+    #[test]
+    fn reasoning_item_is_replayed_before_its_tool_call() {
+        use rig::providers::openai::responses_api::InputItem;
+
+        // A turn that reasoned before calling a tool: [user, reasoning, call,
+        // result, user]. On the next request the reasoning item must be sent
+        // back ahead of the function_call, carrying its encrypted payload — or
+        // the Responses API rejects the call.
+        let mut state = AgentState::new("hi");
+        state.messages.push(AgentMessage::Reasoning {
+            id: "rs_1".into(),
+            encrypted: "ENC_PAYLOAD".into(),
+        });
+        state.messages.push(AgentMessage::ToolCall {
+            id: "fc_read".into(),
+            call_id: Some("call_read".into()),
+            name: "read".into(),
+            args: serde_json::json!({}),
+        });
+        state.messages.push(tool_result("read"));
+        state.messages.push(AgentMessage::User("next".into()));
+
+        let (prompt, history) = build_conversation(&state);
+        let mut messages = history;
+        messages.push(prompt);
+
+        let mut input_items: Vec<InputItem> = Vec::new();
+        for m in messages {
+            let items: Vec<InputItem> = m.try_into().expect("message converts to input items");
+            input_items.extend(items);
+        }
+        let s = serde_json::to_string(&input_items).expect("serialize input items");
+
+        // The reasoning id and encrypted payload must reach the wire...
+        assert!(s.contains("rs_1"), "reasoning id must be serialized: {s}");
+        assert!(
+            s.contains("ENC_PAYLOAD"),
+            "encrypted reasoning payload must be serialized: {s}"
+        );
+        // ...and the reasoning item must precede the function_call it produced.
+        let reasoning_at = s.find("ENC_PAYLOAD").unwrap();
+        let call_at = s.find("function_call").expect("a function_call item is present");
+        assert!(
+            reasoning_at < call_at,
+            "reasoning item must precede its function_call: {s}"
+        );
+    }
+
     #[test]
     fn assistant_history_serializes_as_output_text() {
         use rig::providers::openai::responses_api::InputItem;
