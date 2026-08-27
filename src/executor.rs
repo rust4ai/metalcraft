@@ -88,6 +88,31 @@ pub enum GuardAction {
 /// that just ran, and the next node. Can halt execution early.
 pub type StepGuard<S> = Arc<dyn Fn(&S, &StepEvent) -> GuardAction + Send + Sync>;
 
+/// A source of updates from *outside* the graph, polled at every step boundary.
+///
+/// A running graph is otherwise closed: the only things that change its state
+/// are its own nodes. That is the right default, but it makes one thing
+/// impossible — reaching a run that is already going. A person who types "no,
+/// stop, do the other thing" while an agent is eight tool calls deep can today
+/// only be heard after the run ends, because there is no seam to hand them
+/// through.
+///
+/// This is that seam. It is given the same `(&S, &StepEvent)` a [`StepGuard`]
+/// sees, and whatever [`Reducer::Update`]s it returns are applied to the state
+/// before the next node runs. Returning an empty vec — the common case — costs
+/// one call and changes nothing.
+///
+/// **Choosing the boundary is the caller's job, and it matters.** The mailbox is
+/// polled after *every* step, including between a node that produced tool calls
+/// and the node that answers them. Injecting there can leave a message list the
+/// downstream provider rejects. `event.next` says which node is about to run;
+/// use it to inject only where the state is coherent, and return an empty vec
+/// everywhere else.
+///
+/// [`Reducer::Update`]: crate::Reducer::Update
+pub type Mailbox<S> =
+    Arc<dyn Fn(&S, &StepEvent) -> Vec<<S as Reducer>::Update> + Send + Sync>;
+
 /// An async observer called after each node execution with rich diagnostics.
 /// Purely observational — cannot halt execution. Errors are logged but ignored.
 #[async_trait::async_trait]
@@ -113,6 +138,7 @@ pub struct Executor<S: Reducer> {
     checkpointer: Option<Arc<dyn Checkpointer<S>>>,
     max_steps: usize,
     step_guard: Option<StepGuard<S>>,
+    mailbox: Option<Mailbox<S>>,
     observer: Option<Arc<dyn StepObserver<S>>>,
 }
 
@@ -123,6 +149,7 @@ impl<S: Reducer> Executor<S> {
             checkpointer: None,
             max_steps: 100,
             step_guard: None,
+            mailbox: None,
             observer: None,
         }
     }
@@ -135,6 +162,7 @@ impl<S: Reducer> Executor<S> {
             checkpointer: None,
             max_steps: 100,
             step_guard: None,
+            mailbox: None,
             observer: None,
         }
     }
@@ -158,6 +186,16 @@ impl<S: Reducer> Executor<S> {
     /// loop detection, error-spiral protection, or custom policies.
     pub fn with_step_guard(mut self, guard: StepGuard<S>) -> Self {
         self.step_guard = Some(guard);
+        self
+    }
+
+    /// Attach a [`Mailbox`], letting the world outside the graph add to the
+    /// state of a run already in progress.
+    ///
+    /// Polled at every step boundary, after the guard. Read the `Mailbox` docs
+    /// before wiring one: the caller decides which boundaries are safe.
+    pub fn with_mailbox(mut self, mailbox: Mailbox<S>) -> Self {
+        self.mailbox = Some(mailbox);
         self
     }
 
@@ -206,6 +244,16 @@ impl<S: Reducer> Executor<S> {
                                 reason,
                                 resume_from: next,
                             });
+                        }
+                    }
+
+                    // After the guard: a run being stopped should not first
+                    // absorb messages it will never act on. Before the
+                    // checkpoint, so what is saved is the state the next node
+                    // will actually see.
+                    if let Some(mailbox) = &self.mailbox {
+                        for update in mailbox(&state, &event) {
+                            state.apply(update);
                         }
                     }
 
@@ -551,5 +599,124 @@ impl<S: Reducer> Executor<S> {
         } else {
             Err(GraphError::NoEdge("empty parallel targets".into()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{Graph, NodeOutcome, END};
+
+    /// A state that records what happened to it, in order — enough to tell
+    /// *when* an injected update landed, not merely that it did.
+    #[derive(Clone, Default, Debug)]
+    struct Log {
+        entries: Vec<String>,
+    }
+
+    impl Reducer for Log {
+        type Update = String;
+        fn apply(&mut self, update: String) {
+            self.entries.push(update);
+        }
+    }
+
+    /// A graph of `a → b → END`, each node appending its own name.
+    fn two_step() -> crate::graph::CompiledGraph<Log> {
+        Graph::<Log>::new()
+            .add_node("a", |_s: Log| async move { Ok(NodeOutcome::Update("a".to_string())) })
+            .add_node("b", |_s: Log| async move { Ok(NodeOutcome::Update("b".to_string())) })
+            .add_edge("a", "b")
+            .add_edge("b", END)
+            .set_entry("a")
+            .compile()
+            .expect("graph compiles")
+    }
+
+    #[tokio::test]
+    async fn a_mailbox_update_lands_before_the_next_node_runs() {
+        // Delivered once, after the first step. The ordering is the assertion:
+        // "a", then the injected message, then "b" — if it landed late the run
+        // would read a, b, injected, and the next node would never have seen it.
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mailbox: Mailbox<Log> = {
+            let delivered = delivered.clone();
+            Arc::new(move |_state, _event| {
+                if delivered.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    Vec::new()
+                } else {
+                    vec!["injected".to_string()]
+                }
+            })
+        };
+
+        let outcome = Executor::new(two_step())
+            .with_mailbox(mailbox)
+            .run(Log::default(), "t")
+            .await
+            .expect("run succeeds");
+
+        let RunOutcome::Completed(state) = outcome else {
+            panic!("expected completion");
+        };
+        assert_eq!(state.entries, vec!["a", "injected", "b"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_mailbox_changes_nothing() {
+        let mailbox: Mailbox<Log> = Arc::new(|_state, _event| Vec::new());
+        let outcome = Executor::new(two_step())
+            .with_mailbox(mailbox)
+            .run(Log::default(), "t")
+            .await
+            .expect("run succeeds");
+        let RunOutcome::Completed(state) = outcome else {
+            panic!("expected completion");
+        };
+        assert_eq!(state.entries, vec!["a", "b"]);
+    }
+
+    /// `event.next` is what lets a caller pick its boundary — the whole reason
+    /// the mailbox is handed the event rather than just the state.
+    #[tokio::test]
+    async fn a_mailbox_can_choose_which_boundary_it_delivers_on() {
+        let mailbox: Mailbox<Log> = Arc::new(|_state, event| {
+            if event.next == "b" {
+                Vec::new()
+            } else {
+                vec![format!("before:{}", event.next)]
+            }
+        });
+        let outcome = Executor::new(two_step())
+            .with_mailbox(mailbox)
+            .run(Log::default(), "t")
+            .await
+            .expect("run succeeds");
+        let RunOutcome::Completed(state) = outcome else {
+            panic!("expected completion");
+        };
+        // Nothing injected before "b"; one injection before END.
+        assert_eq!(state.entries, vec!["a", "b", "before:__end__"]);
+    }
+
+    /// A run being stopped must not first absorb messages it will never act on:
+    /// the guard is asked before the mailbox is drained.
+    #[tokio::test]
+    async fn a_stopped_run_does_not_absorb_the_mailbox() {
+        let guard: StepGuard<Log> = Arc::new(|_state, _event| GuardAction::Stop("stopped".into()));
+        let mailbox: Mailbox<Log> = Arc::new(|_state, _event| vec!["injected".to_string()]);
+
+        let outcome = Executor::new(two_step())
+            .with_step_guard(guard)
+            .with_mailbox(mailbox)
+            .run(Log::default(), "t")
+            .await
+            .expect("run succeeds");
+
+        let RunOutcome::Interrupted { state, reason, .. } = outcome else {
+            panic!("expected an interrupt");
+        };
+        assert_eq!(reason, "stopped");
+        assert_eq!(state.entries, vec!["a"], "nothing should have been injected");
     }
 }

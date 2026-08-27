@@ -365,6 +365,21 @@ pub enum AgentUpdate {
     FinalAnswer(String),
     /// Tool execution results.
     ToolResults(Vec<ToolResult>),
+    /// A message from the user, arriving mid-run through a [`Mailbox`].
+    ///
+    /// Ordinary turns do not use this: a turn starts *from* a user message, and
+    /// the state already carries it. This is for the person who says something
+    /// while the agent is still working — the message joins the conversation the
+    /// run is already having, rather than waiting for a run that may be minutes
+    /// from finishing.
+    ///
+    /// Where it lands is the caller's problem, not this variant's: appended to
+    /// `messages` like any other, so injecting it between a tool call and its
+    /// result produces exactly the orphaned-call history the Responses API
+    /// rejects. See [`Mailbox`] for the rule.
+    ///
+    /// [`Mailbox`]: crate::Mailbox
+    UserMessage(String),
 }
 
 impl Reducer for AgentState {
@@ -372,6 +387,9 @@ impl Reducer for AgentState {
 
     fn apply(&mut self, update: AgentUpdate) {
         match update {
+            AgentUpdate::UserMessage(text) => {
+                self.messages.push(AgentMessage::User(text));
+            }
             AgentUpdate::ToolCalls { reasoning, calls } => {
                 // Reasoning items must precede the tool call(s) they produced so
                 // the Responses API accepts the replayed `function_call`.
