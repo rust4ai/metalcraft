@@ -994,9 +994,22 @@ pub fn create_react_agent_with_options<M: CompletionModel + 'static>(
 }
 
 /// True if the most recently executed tool batch (the trailing run of
-/// `ToolResult` messages on `state`) invoked any tool named in `terminal_tools`.
-/// Used by [`create_react_agent_with_options`] to decide whether a turn ends
-/// after the `tools` node runs.
+/// `ToolResult` messages on `state`) invoked any tool named in `terminal_tools`
+/// **and that call succeeded**. Used by [`create_react_agent_with_options`] to
+/// decide whether a turn ends after the `tools` node runs.
+///
+/// The success requirement is the whole point of reading the result and not just
+/// the name. A terminal tool is terminal because calling it *delivers* something
+/// — `say_to_user` hands the reply to a channel. When that call fails, nothing
+/// was delivered, so ending the turn on it ends it in silence: the user waits on
+/// a reply the agent believes it already sent. Looping back to the agent instead
+/// gives the model the error and a chance to say something that lands.
+///
+/// It also makes a terminal tool able to *decline*. Returning an error from
+/// `say_to_user` now means "not yet" and returns control to the model, which is
+/// how an agent can be held to an unfinished plan rather than being free to
+/// close the turn the moment one delegation returns. Callers that use this must
+/// bound their own refusals — a tool that always declines never lets a turn end.
 fn invoked_terminal_tool(state: &AgentState, terminal_tools: &[String]) -> bool {
     state
         .messages
@@ -1004,9 +1017,19 @@ fn invoked_terminal_tool(state: &AgentState, terminal_tools: &[String]) -> bool 
         .rev()
         .take_while(|m| matches!(m, AgentMessage::ToolResult { .. }))
         .any(|m| match m {
-            AgentMessage::ToolResult { name, .. } => terminal_tools.iter().any(|t| t == name),
+            AgentMessage::ToolResult { name, result, .. } => {
+                terminal_tools.iter().any(|t| t == name) && !is_tool_error(result)
+            }
             _ => false,
         })
+}
+
+/// The error marker the tool node writes for a call that returned `Err`
+/// (`format!("ERROR: {e}")`), plus the interrupt/backfill results that use the
+/// same prefix. Kept as one predicate so the terminal-tool rule and any future
+/// reader agree on what "the call failed" looks like on the wire.
+fn is_tool_error(result: &str) -> bool {
+    result.starts_with("ERROR:")
 }
 
 #[cfg(test)]
@@ -1131,6 +1154,57 @@ mod tests {
         let mut state = AgentState::new("hi");
         state.messages.push(tool_result("say_to_user"));
         assert!(!invoked_terminal_tool(&state, &[]));
+    }
+
+    fn failed_tool_result(name: &str, message: &str) -> AgentMessage {
+        AgentMessage::ToolResult {
+            id: format!("call_{name}"),
+            call_id: None,
+            name: name.to_string(),
+            result: format!("ERROR: {message}"),
+        }
+    }
+
+    /// A terminal tool that *failed* delivered nothing, so the turn must not end
+    /// on it — otherwise the user waits forever on a reply the agent thinks it
+    /// sent. The model gets the error back and can try again.
+    #[test]
+    fn failed_terminal_tool_does_not_end_the_turn() {
+        let terminal = vec!["say_to_user".to_string()];
+        let mut state = AgentState::new("hi");
+        state
+            .messages
+            .push(failed_tool_result("say_to_user", "failed to deliver reply"));
+        assert!(!invoked_terminal_tool(&state, &terminal));
+    }
+
+    /// The same rule is what lets a terminal tool decline: an error means "not
+    /// yet", and control returns to the model instead of closing the turn.
+    #[test]
+    fn a_declining_terminal_tool_returns_control_to_the_agent() {
+        let terminal = vec!["say_to_user".to_string()];
+        let mut state = AgentState::new("hi");
+        state.messages.push(failed_tool_result(
+            "say_to_user",
+            "plan has 2 open steps; finish them or ask the user",
+        ));
+        assert!(!invoked_terminal_tool(&state, &terminal));
+        // ...and once it succeeds, the turn ends as before.
+        state.messages.push(AgentMessage::Assistant(String::new()));
+        state.messages.push(tool_result("say_to_user"));
+        assert!(invoked_terminal_tool(&state, &terminal));
+    }
+
+    /// One failed terminal call in a batch does not veto a successful one.
+    #[test]
+    fn a_successful_terminal_call_still_ends_a_mixed_batch() {
+        let terminal = vec!["say_to_user".to_string(), "ask_user".to_string()];
+        let mut state = AgentState::new("hi");
+        state
+            .messages
+            .push(failed_tool_result("say_to_user", "plan has open steps"));
+        state.messages.push(tool_result("ask_user"));
+        assert!(invoked_terminal_tool(&state, &terminal));
     }
 
     /// Regression for the multi-turn HTTP 400 from the OpenAI Responses API:
